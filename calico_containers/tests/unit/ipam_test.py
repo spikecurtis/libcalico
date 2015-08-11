@@ -256,6 +256,47 @@ class TestIPAMClient(unittest.TestCase):
                                IPAddress("192.168.0.2"),
                                IPAddress("192.168.0.3")], ipv4s)
 
+    @patch("pycalico.block.my_hostname", "test_host1")
+    def test_auto_assign_random_blocks(self):
+        """
+        Test auto assign when all blocks our blocks are full and all other
+        blocks already have host affinity.
+        """
+
+        affine_blocks = [IPNetwork("10.11.12.0/24"),
+                         IPNetwork("10.11.45.0/24")]
+
+        def m_get_affine_blocks(self, host, ip_version, pool):
+            return affine_blocks
+
+        rando_blocks = set()
+
+        def m_read_block(self, block_cidr):
+            if block_cidr in affine_blocks:
+                # All our blocks are full.
+                block = AllocationBlock(block_cidr, "test_host1")
+                block.auto_assign(256, None, {})
+            else:
+                # Other blocks are not.
+                block = AllocationBlock(block_cidr, "test_host2")
+                rando_blocks.add(block)
+            return block
+
+        def m_get_ip_pools(self, version):
+            return [IPPool("10.11.0.0/18")]
+
+        with patch("pycalico.ipam.BlockReaderWriter._get_affine_blocks",
+                   m_get_affine_blocks),\
+             patch("pycalico.datastore.DatastoreClient.get_ip_pools",
+                   m_get_ip_pools),\
+             patch("pycalico.ipam.BlockReaderWriter._read_block",
+                   m_read_block):
+            (ipv4s, ipv6s) = self.client.auto_assign_ips(4, 0, None, {})
+            assert_equal(len(ipv4s), 4)
+            assert_equal(len(rando_blocks), 1)
+            rando_block = rando_blocks.pop()
+            for ip in ipv4s:
+                assert_true(ip in rando_block.cidr)
 
     @patch("pycalico.block.my_hostname", "test_host1")
     def test_assign(self):
@@ -860,6 +901,93 @@ class TestBlockReaderWriter(unittest.TestCase):
             # Spot check last call is the last subnet in 10.11.0.0/16 pool.
             assert_equal(self.m_etcd_client.read.call_args[0][0],
                          _datastore_key(IPNetwork("10.11.255.0/24")))
+
+    def test_random_blocks(self):
+        """
+        Test _random_blocks() mainline.
+        """
+        def m_get_ip_pools(self, version):
+            return [IPPool("10.11.0.0/16")]
+
+        excluded_ids = [IPNetwork("10.11.23.0/24"),
+                        IPNetwork("10.11.45.0/24"),
+                        IPNetwork("10.45.45.0/24")]
+
+        with patch("pycalico.datastore.DatastoreClient.get_ip_pools",
+                   m_get_ip_pools):
+            random_blocks = self.client._random_blocks(excluded_ids, 4, None)
+
+            # Excluded 3, but only 2 in the pool, so 256 - 2 = 254 blocks.
+            assert_equal(len(random_blocks), 254)
+
+            # Assert we correctly exclude IDs
+            for cidr in excluded_ids:
+                assert_not_in(cidr, random_blocks)
+
+            # Spot check some cidrs
+            assert_in(IPNetwork("10.11.0.0/24"), random_blocks)
+            assert_in(IPNetwork("10.11.0.1/24"), random_blocks)
+            assert_in(IPNetwork("10.11.0.255/24"), random_blocks)
+            assert_in(IPNetwork("10.11.0.127/24"), random_blocks)
+
+            # check we aren't doing something stupid, like returning the same
+            # order every time.
+            random_blocks2 = self.client._random_blocks(excluded_ids, 4, None)
+            assert_equal(len(random_blocks2), 254)
+
+            differs = False
+            for ii in range(len(random_blocks2)):
+                assert_in(random_blocks2[ii], random_blocks)
+                if random_blocks[ii] != random_blocks2[ii]:
+                    differs = True
+            assert_true(differs)
+
+    def test_random_blocks_bad_pool(self):
+        """
+        Test _random_blocks when the requested pool isn't in IPPools.
+        """
+
+        def m_get_ip_pools(self, version):
+            return [IPPool("10.11.0.0/16"),
+                    IPPool("192.168.0.0/16")]
+
+        with patch("pycalico.datastore.DatastoreClient.get_ip_pools",
+                   m_get_ip_pools):
+            assert_raises(ValueError, self.client._random_blocks,
+                          [], 4, IPPool("10.1.0.0/16"))
+
+    def test_random_blocks_good_pool(self):
+        """
+        Test _random_blocks() when restricted to a single pool.
+        """
+        def m_get_ip_pools(self, version):
+            return [IPPool("10.45.0.0/16"),
+                    IPPool("10.11.0.0/16")]
+
+        excluded_ids = [IPNetwork("10.11.23.0/24"),
+                        IPNetwork("10.11.45.0/24"),
+                        IPNetwork("10.45.45.0/24")]
+
+        with patch("pycalico.datastore.DatastoreClient.get_ip_pools",
+                   m_get_ip_pools):
+            random_blocks = self.client._random_blocks(excluded_ids, 4,
+                                                       IPPool("10.11.0.0/16"))
+
+            # Excluded 3, but only 2 in the pool, so 256 - 2 = 254 blocks.
+            assert_equal(len(random_blocks), 254)
+
+            # Assert we correctly exclude IDs
+            for cidr in excluded_ids:
+                assert_not_in(cidr, random_blocks)
+
+            # Spot check some cidrs
+            assert_in(IPNetwork("10.11.0.0/24"), random_blocks)
+            assert_in(IPNetwork("10.11.0.1/24"), random_blocks)
+            assert_in(IPNetwork("10.11.0.255/24"), random_blocks)
+            assert_in(IPNetwork("10.11.0.127/24"), random_blocks)
+
+
+
 
 
 

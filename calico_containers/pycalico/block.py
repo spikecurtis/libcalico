@@ -56,8 +56,7 @@ class AllocationBlock(object):
         assert cidr_prefix.cidr == cidr_prefix
 
         # Make sure the block is the right size.
-        assert cidr_prefix.prefixlen == (BITS_BY_VERSION[cidr_prefix.version] -
-                                         BLOCK_SIZE_BITS)
+        assert cidr_prefix.prefixlen == (BLOCK_PREFIXLEN[cidr_prefix.version])
         self.cidr = cidr_prefix
         self.db_result = None
 
@@ -81,7 +80,13 @@ class AllocationBlock(object):
 
         self.attributes = []
         """
-        Dictionaries of attributes for allocations.
+        List of dictionaries of attributes for allocations.
+
+        Each has the format:
+        {
+            ATTR_PRIMARY: <primary handle key>,
+            ATTR_SECONDARY: {...}
+        }
         """
 
     def to_json(self):
@@ -252,15 +257,15 @@ class AllocationBlock(object):
         # Compute which attributes need to be cleaned up.  We do this by
         # reference counting.  If we're deleting all the references, then it
         # needs to be cleaned up.
-        attr_index_to_delete = set()
+        attr_indexes_to_delete = set()
         ref_counts = self._get_attribute_ref_counts()
         for idx, refs in deleting_ref_counts.iteritems():
             if ref_counts[idx] == refs:
-                attr_index_to_delete.add(idx)
+                attr_indexes_to_delete.add(idx)
 
         # Delete attributes if necessary
-        if attr_index_to_delete:
-            self._delete_attributes(attr_index_to_delete, ordinals)
+        if attr_indexes_to_delete:
+            self._delete_attributes(attr_indexes_to_delete, ordinals)
 
         # All attributes updated.  Finally, release all the requested
         # addressses.
@@ -269,11 +274,14 @@ class AllocationBlock(object):
 
         return unallocated
 
-    def _delete_attributes(self, attr_index_to_delete, ordinals):
+    def _delete_attributes(self, attr_indexes_to_delete, ordinals):
         """
         Delete some attributes (used during release processing).
 
-        :param attr_index_to_delete: set of indexes of attributes to delete
+        This removes the attributes from the self.attributes list, and updates
+        the allocation list with the new indexes.
+
+        :param attr_indexes_to_delete: set of indexes of attributes to delete
         :param ordinals: list of ordinals of IPs to release (for debugging)
         :return: None.
         """
@@ -281,7 +289,7 @@ class AllocationBlock(object):
         new_attributes = []
         y = 0  # next free slot in new attributes list.
         for x in xrange(len(self.attributes)):
-            if x in attr_index_to_delete:
+            if x in attr_indexes_to_delete:
                 # current attr at x being deleted.
                 new_indexes[x] = None
             else:
@@ -363,15 +371,14 @@ def get_block_cidr_for_address(address):
     :param address: IPAddress
     """
     prefix = PREFIX_MASK[address.version] & address
-    prefixlen = BITS_BY_VERSION[address.version] - BLOCK_SIZE_BITS
-    block_id = "%s/%s" %(prefix, prefixlen)
+    block_id = "%s/%s" % (prefix, BLOCK_PREFIXLEN[address.version])
     return IPNetwork(block_id)
 
 
 class NoHostAffinityWarning(Exception):
     """
-    Tried to auto-assign in a block this host didn't own.  This exection can be
-    explicitly disabled.
+    Tried to auto-assign in a block this host didn't own.  This exception can
+    be explicitly disabled.
     """
     pass
 

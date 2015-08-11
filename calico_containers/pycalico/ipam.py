@@ -19,6 +19,7 @@ from types import NoneType
 import socket
 import json
 import logging
+import random
 
 from pycalico.datastore_datatypes import IPPool
 from pycalico.datastore import CALICO_V_PATH, DatastoreClient, handle_errors
@@ -116,7 +117,7 @@ class BlockReaderWriter(DatastoreClient):
 
     def _new_affine_block(self, host, version, pool):
         """
-        Create an register a new affine block for the host.
+        Create and register a new affine block for the host.
 
         :param host: The host name to get a block for.
         :param version: 4 for IPv4, 6 for IPv6.
@@ -186,6 +187,42 @@ class BlockReaderWriter(DatastoreClient):
             raise KeyError(block_id)
         # successfully created the block.  Done.
         return
+
+    def _random_blocks(self, excluded_ids, version, pool):
+        """
+        Get an list of block CIDRs, in random order.
+
+        :param excluded_ids: List of IDs that should be excluded.
+        :param version: The IP version 4, or 6.
+        :param pool: IPPool to get blocks from, or None to use all pools
+        :return: An iterator of block CIDRs.
+        """
+
+        # Get the pools and verify we got a valid one, or none.
+        ip_pools = self.get_ip_pools(version)
+        if pool is not None:
+            if pool not in ip_pools:
+                raise ValueError("Requested pool %s is not configured or has"
+                                 "wrong attributes" % pool)
+            # Confine search to only the one pool.
+            ip_pools = [pool]
+
+        random_blocks = []
+        i = 0
+        for pool in ip_pools:
+            for block_cidr in pool.cidr.subnet(BLOCK_PREFIXLEN[version]):
+                if block_cidr not in excluded_ids:
+                    # add this block.  We use an "inside-out" Fisher-Yates
+                    # shuffle to randomize the list as we create it.  See
+                    # http://en.wikipedia.org/wiki/Fisher%E2%80%93Yates_shuffle
+                    j = random.randint(0, i)
+                    if j != i:
+                        random_blocks.append(random_blocks[j])
+                        random_blocks[j] = block_cidr
+                    else:
+                        random_blocks.append(block_cidr)
+                    i += 1
+        return random_blocks
 
 
 class CASError(Exception):
@@ -263,9 +300,10 @@ class IPAMClient(BlockReaderWriter):
         :return:
         """
 
-        block_ids = iter(self._get_affine_blocks(my_hostname,
-                                                 ip_version,
-                                                 pool))
+        block_list = self._get_affine_blocks(my_hostname,
+                                             ip_version,
+                                             pool)
+        block_ids = iter(block_list)
         allocated_ips = []
 
         num_remaining = num
@@ -308,13 +346,29 @@ class IPAMClient(BlockReaderWriter):
         # with some affinity to us, and tried (and failed) to allocate new
         # ones.  Our last option is a random hunt through any blocks we haven't
         # yet tried.
-        # TODO: SJC add this function.
+        if num_remaining > 0:
+            random_blocks = iter(self._random_blocks(block_list,
+                                                     ip_version,
+                                                     pool))
+        while num_remaining > 0:
+            try:
+                block_id = random_blocks.next()
+            except StopIteration:
+                break
+            ips = self._auto_assign_block(block_id,
+                                          num_remaining,
+                                          primary_key,
+                                          attributes,
+                                          affinity_check=False)
+            allocated_ips.extend(ips)
+            num_remaining = num - len(allocated_ips)
 
         return allocated_ips
 
-    def _auto_assign_block(self, block_id, num, primary_key, attributes):
+    def _auto_assign_block(self, block_id, num, primary_key, attributes,
+                           affinity_check=True):
         """
-        Automatically pic IPs from a block and commit them to the data store.
+        Automatically pick IPs from a block and commit them to the data store.
 
         :param block_id: The identifier for the block to read.
         :param num: The number of IPs to assign.
@@ -322,13 +376,18 @@ class IPAMClient(BlockReaderWriter):
         :param attributes: Contents of this dict will be stored with the
         assignment and can be queried using get_assignment_attributes().  Must be
         JSON serializable.
+        :param affinity_check: True to enable checking the host has the
+        affinity to the block, False to disable this check, for example, while
+        randomly searching after failure to get affine block.
         :return: List of assigned IPs.
         """
+        _log.debug("Auto-assigning from block %s", block_id)
         for _ in xrange(RETRIES):
             block = self._read_block(block_id)
             unconfirmed_ips = block.auto_assign(num=num,
                                                 primary_key=primary_key,
-                                                attributes=attributes)
+                                                attributes=attributes,
+                                                affinity_check=affinity_check)
             if len(unconfirmed_ips) == 0:
                 # Block is full.
                 return []
