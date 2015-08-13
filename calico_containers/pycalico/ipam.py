@@ -28,6 +28,8 @@ from pycalico.block import (AllocationBlock,
                             get_block_cidr_for_address,
                             BLOCK_PREFIXLEN,
                             AlreadyAssignedError)
+from pycalico.handle import (AllocationHandle,
+                             AddressCountTooLow)
 
 _log = logging.getLogger(__name__)
 
@@ -35,15 +37,16 @@ IPAM_V_PATH = "/calico/ipam/v1/"
 IPAM_HOST_PATH = IPAM_V_PATH + "host/%(hostname)s/"
 IPAM_HOST_AFFINITY_PATH = IPAM_HOST_PATH + "ipv%(version)d/block/"
 IPAM_BLOCK_PATH = IPAM_V_PATH + "assignment/ipv%(version)d/block/"
+IPAM_HANDLE_PATH = IPAM_V_PATH + "handle/"
 RETRIES = 100
 
 my_hostname = socket.gethostname()
 
 
-class BlockReaderWriter(DatastoreClient):
+class BlockHandleReaderWriter(DatastoreClient):
     """
-    Can read and write allocation blocks to the data store, as well as related
-    bits of state.
+    Can read and write allocation blocks and handles to the data store, as well
+    as related bits of state.
 
     This class keeps etcd specific code from being in the main IPAMClient
     class.
@@ -55,7 +58,7 @@ class BlockReaderWriter(DatastoreClient):
         :param block_cidr: The IPNetwork identifier for a block.
         :return: An AllocationBlock object
         """
-        key = _datastore_key(block_cidr)
+        key = _block_datastore_key(block_cidr)
         try:
             result = self.etcd_client.read(key)
         except EtcdKeyNotFound:
@@ -76,7 +79,7 @@ class BlockReaderWriter(DatastoreClient):
                 raise CASError(str(block.cidr))
         else:
             # Block is new.  Write it with prevExist=False
-            key = _datastore_key(block.cidr)
+            key = _block_datastore_key(block.cidr)
             value = block.to_json()
             try:
                 self.etcd_client.write(key, value, prevExist=False)
@@ -138,7 +141,7 @@ class BlockReaderWriter(DatastoreClient):
             for block_cidr in pool.cidr.subnet(BLOCK_PREFIXLEN[version]):
                 block_id = str(block_cidr)
                 _log.debug("Checking if block %s is free.", block_id)
-                key = _datastore_key(block_cidr)
+                key = _block_datastore_key(block_cidr)
                 try:
                     _ = self.etcd_client.read(key)
                 except EtcdKeyNotFound:
@@ -224,6 +227,111 @@ class BlockReaderWriter(DatastoreClient):
                     i += 1
         return random_blocks
 
+    def _increment_handle(self, handle_id, block_cidr, amount):
+        """
+        Increment the allocation count on the given handle for the given block
+        by the given amount.
+        """
+        for _ in xrange(RETRIES):
+            try:
+                handle = self._read_handle(handle_id)
+            except KeyError:
+                # handle doesn't exist.  Create it.
+                handle = AllocationHandle(handle_id)
+
+            _ = handle.increment_block(block_cidr, amount)
+
+            try:
+                self._compare_and_swap_handle(handle)
+            except CASError:
+                # CAS failed.  Retry.
+                continue
+            else:
+                # success!
+                return
+        raise RuntimeError("Max retries hit.")  # pragma: no cover
+
+    def _decrement_handle(self, handle_id, block_cidr, amount):
+        """
+        Decrement the allocation count on the given handle for the given block
+        by the given amount.
+        """
+        for _ in xrange(RETRIES):
+            try:
+                handle = self._read_handle(handle_id)
+            except KeyError:
+                # This is bad.  The handle doesn't exist, which means something
+                # really wrong has happened, like DB corruption.
+                _log.error("Can't decrement block %s on handle %s; it doesn't "
+                           "exist.", str(block_cidr, handle_id))
+                raise
+
+            try:
+                handle.decrement_block(block_cidr, amount)
+            except AddressCountTooLow:
+                # This is also bad.  The handle says it has fewer than the
+                # requested amount of addresses allocated on the block.  This
+                # means the DB is corrupted.
+                _log.error("Can't decrement block %s on handle %s; too few "
+                           "allocated.", str(block_cidr), handle_id)
+                raise
+
+            try:
+                self._compare_and_swap_handle(handle)
+            except CASError:
+                continue
+            else:
+                # Success!
+                return
+        raise RuntimeError("Max retries hit.")  # pragma: no cover
+
+    def _read_handle(self, handle_id):
+        """
+        Read the handle with the given handle ID from the data store.
+        :param handle_id: The handle ID to read.
+        :return: AllocationHandle object.
+        """
+        key = _handle_datastore_key(handle_id)
+        try:
+            result = self.etcd_client.read(key)
+        except EtcdKeyNotFound:
+            raise KeyError(handle_id)
+        handle = AllocationHandle.from_etcd_result(result)
+        return handle
+
+    def _compare_and_swap_handle(self, handle):
+        """
+        Write the handle using an atomic Compare-and-swap.
+        """
+        # If the handle has a db_result, CAS against that.
+        if handle.db_result is not None:
+            _log.debug("Handle %s exists.", handle.handle_id)
+            if handle.is_empty():
+                # Handle is now empty.  Delete it instead of an update.
+                _log.debug("Handle %s is empty.", handle.handle_id)
+                key = _handle_datastore_key(handle.handle_id)
+                try:
+                    self.etcd_client.delete(
+                        key,
+                        prevIndex=handle.db_result.modifiedIndex)
+                except EtcdAlreadyExist:
+                    raise CASError(handle.handle_id)
+            else:
+                _log.debug("Handle %s is not empty.", handle.handle_id)
+                try:
+                    self.etcd_client.update(handle.update_result())
+                except EtcdAlreadyExist:
+                    raise CASError(handle.handle_id)
+        else:
+            # Handle is new.  Write it with prevExist=False
+            assert not handle.is_empty(), "Don't write empty handle."
+            key = _handle_datastore_key(handle.handle_id)
+            value = handle.to_json()
+            try:
+                self.etcd_client.write(key, value, prevExist=False)
+            except EtcdAlreadyExist:
+                raise CASError(handle.handle_id)
+
 
 class CASError(Exception):
     """
@@ -239,7 +347,7 @@ class NoFreeBlocksError(Exception):
     pass
 
 
-def _datastore_key(block_cidr):
+def _block_datastore_key(block_cidr):
     """
     Translate a block_id into a datastore key.
     :param block_cidr: IPNetwork representing the block
@@ -249,18 +357,28 @@ def _datastore_key(block_cidr):
     return path + str(block_cidr).replace("/", "-")
 
 
-class IPAMClient(BlockReaderWriter):
+def _handle_datastore_key(handle_id):
+    """
+    Translate a handle_id into a datastore key.
+    :param handle_id: String key
+    :return: etcd key as string.
+    """
+    return IPAM_HANDLE_PATH + handle_id
 
-    def auto_assign_ips(self, num_v4, num_v6, primary_key, attributes,
+
+class IPAMClient(BlockHandleReaderWriter):
+
+    def auto_assign_ips(self, num_v4, num_v6, handle_id, attributes,
                         pool=(None, None)):
         """
-        Automatically pick and assign the given number of IPv4 and IPv6 addresses.
+        Automatically pick and assign the given number of IPv4 and IPv6
+        addresses.
 
         :param num_v4: Number of IPv4 addresses to request
         :param num_v6: Number of IPv6 addresses to request
-        :param primary_key: allocation primary key for this request.  You can query
-        this key using get_assignments_by_key() or release all addresses with
-        this key using release_by_key().
+        :param handle_id: allocation handle ID for this request.  You can query
+        this key using get_assignments_by_handle() or release all addresses
+        with this key using release_by_handle().
         :param attributes: Contents of this dict will be stored with the
         assignment and can be queried using get_assignment_attributes().  Must be
         JSON serializable.
@@ -270,14 +388,15 @@ class IPAMClient(BlockReaderWriter):
         configured pools are at or near exhaustion, this method may return
         fewer than requested addresses.
         """
+        assert isinstance(handle_id, str) or handle_id is None
 
-        v4_address_list = self._auto_assign(4, num_v4, primary_key,
+        v4_address_list = self._auto_assign(4, num_v4, handle_id,
                                             attributes, pool[0])
-        v6_address_list = self._auto_assign(6, num_v6, primary_key,
+        v6_address_list = self._auto_assign(6, num_v6, handle_id,
                                             attributes, pool[1])
         return v4_address_list, v6_address_list
 
-    def _auto_assign(self, ip_version, num, primary_key, attributes, pool):
+    def _auto_assign(self, ip_version, num, handle_id, attributes, pool):
         """
         Auto assign addresses from a specific IP version.
 
@@ -291,7 +410,7 @@ class IPAMClient(BlockReaderWriter):
 
         :param ip_version: 4 or 6, the IP version number.
         :param num: Number of addresses to assign.
-        :param primary_key: allocation primary key for this request.
+        :param handle_id: allocation handle ID for this request.
         :param attributes: Contents of this dict will be stored with the
         assignment and can be queried using get_assignment_attributes().  Must
         be JSON serializable.
@@ -299,6 +418,7 @@ class IPAMClient(BlockReaderWriter):
         automatically choose a pool.
         :return:
         """
+        assert isinstance(handle_id, str) or handle_id is None
 
         block_list = self._get_affine_blocks(my_hostname,
                                              ip_version,
@@ -314,7 +434,7 @@ class IPAMClient(BlockReaderWriter):
                 break
             ips = self._auto_assign_block(block_id,
                                           num_remaining,
-                                          primary_key,
+                                          handle_id,
                                           attributes)
             allocated_ips.extend(ips)
             num_remaining = num - len(allocated_ips)
@@ -335,7 +455,7 @@ class IPAMClient(BlockReaderWriter):
                 break
             ips = self._auto_assign_block(new_block,
                                           num_remaining,
-                                          primary_key,
+                                          handle_id,
                                           attributes)
             allocated_ips.extend(ips)
             num_remaining = num - len(allocated_ips)
@@ -357,7 +477,7 @@ class IPAMClient(BlockReaderWriter):
                 break
             ips = self._auto_assign_block(block_id,
                                           num_remaining,
-                                          primary_key,
+                                          handle_id,
                                           attributes,
                                           affinity_check=False)
             allocated_ips.extend(ips)
@@ -365,55 +485,70 @@ class IPAMClient(BlockReaderWriter):
 
         return allocated_ips
 
-    def _auto_assign_block(self, block_id, num, primary_key, attributes,
+    def _auto_assign_block(self, block_cidr, num, handle_id, attributes,
                            affinity_check=True):
         """
         Automatically pick IPs from a block and commit them to the data store.
 
-        :param block_id: The identifier for the block to read.
+        :param block_cidr: The identifier for the block to read.
         :param num: The number of IPs to assign.
-        :param primary_key: allocation primary key for this request.
+        :param handle_id: allocation handle ID for this request.
         :param attributes: Contents of this dict will be stored with the
-        assignment and can be queried using get_assignment_attributes().  Must be
-        JSON serializable.
+        assignment and can be queried using get_assignment_attributes().  Must
+        be JSON serializable.
         :param affinity_check: True to enable checking the host has the
         affinity to the block, False to disable this check, for example, while
         randomly searching after failure to get affine block.
         :return: List of assigned IPs.
         """
-        _log.debug("Auto-assigning from block %s", block_id)
+        assert isinstance(handle_id, str) or handle_id is None
+        _log.debug("Auto-assigning from block %s", block_cidr)
         for _ in xrange(RETRIES):
-            block = self._read_block(block_id)
+            block = self._read_block(block_cidr)
             unconfirmed_ips = block.auto_assign(num=num,
-                                                primary_key=primary_key,
+                                                handle_id=handle_id,
                                                 attributes=attributes,
                                                 affinity_check=affinity_check)
             if len(unconfirmed_ips) == 0:
                 # Block is full.
                 return []
+
+            # If using a handle, increment the handle by the number of
+            # confirmed IPs.
+            if handle_id is not None:
+                self._increment_handle(handle_id,
+                                       block_cidr,
+                                       len(unconfirmed_ips))
+
             try:
                 self._compare_and_swap_block(block)
             except CASError:
+                # Failed to allocate.  Back out the handle changes if needed.
+                if handle_id is not None:
+                    self._decrement_handle(handle_id,
+                                           block_cidr,
+                                           len(unconfirmed_ips))
                 continue
             else:
                 # Confirm the IPs.
                 return unconfirmed_ips
         raise RuntimeError("Hit Max Retries.")  # pragma: no cover
 
-    def assign_ip(self, address, primary_key, attributes):
+    def assign_ip(self, address, handle_id, attributes):
         """
-        Assign the given address.  Throws AlreadyAssignedError if the address is
-        taken.
+        Assign the given address.  Throws AlreadyAssignedError if the address
+        is taken.
 
         :param address: IPAddress to assign.
-        :param primary_key: allocation primary key for this request.  You can query
-        this key using get_assignments_by_key() or release all addresses with
-        this key using release_by_key().
+        :param handle_id: allocation handle ID for this request.  You can
+        query this key using get_assignments_by_handle() or release all
+        addresses with this handle_id using release_by_handle().
         :param attributes: Contents of this dict will be stored with the
-        assignment and can be queried using get_assignment_attributes().  Must be
-        JSON serializable.
+        assignment and can be queried using get_assignment_attributes().  Must
+        be JSON serializable.
         :return: None.
         """
+        assert isinstance(handle_id, str) or handle_id is None
         assert isinstance(address, IPAddress)
         block_cidr = get_block_cidr_for_address(address)
 
@@ -440,13 +575,22 @@ class IPAMClient(BlockReaderWriter):
                                      address)
 
             # Try to assign.  Throws exception if already assigned -- let it.
-            block.assign(address, primary_key, attributes)
+            block.assign(address, handle_id, attributes)
+
+            # If using a handle, increment by one IP
+            if handle_id is not None:
+                self._increment_handle(handle_id, block_cidr, 1)
 
             # Try to commit
             try:
                 self._compare_and_swap_block(block)
                 return  # Success!
             except CASError:
+                # Failed to commit.  Back out handle if necessary.
+                if handle_id is not None:
+                    self._decrement_handle(handle_id,
+                                           block_cidr,
+                                           1)
                 continue
         raise RuntimeError("Hit max retries.")  # pragma: no cover
 
@@ -491,7 +635,7 @@ class IPAMClient(BlockReaderWriter):
                 # Block doesn't exist, so all addresses are already
                 # unallocated.
                 return addresses
-            unallocated = block.release(addresses)
+            (unallocated, handles) = block.release(addresses)
             assert len(unallocated) <= len(addresses)
             if len(unallocated) == len(addresses):
                 # All the addresses are already unallocated.
@@ -499,28 +643,81 @@ class IPAMClient(BlockReaderWriter):
             # Try to commit
             try:
                 self._compare_and_swap_block(block)
-                return unallocated  # Success!
             except CASError:
                 continue
+            else:
+                # Success!  Decrement handles.
+                for handle_id, amount in handles.iteritems():
+                    if handle_id is not None:
+                        # Skip the None handle, it's a special value meaning
+                        # the addresses were not allocated with a handle.
+                        self._decrement_handle(handle_id, block_cidr, amount)
+
+                return unallocated
+
         raise RuntimeError("Hit Max retries.")  # pragma: no cover
 
-
-    def get_ip_assignments_by_key(self, primary_key):
+    def get_ip_assignments_by_handle(self, handle_id):
         """
         Return a list of IPAddresses assigned to the key.
-        :param primary_key: Key to query e.g. used on assign() or auto_assign().
+        :param handle_id: Key to query e.g. used on assign() or auto_assign().
         :return: List of IPAddresses
         """
-        pass
+        assert isinstance(handle_id, str)
 
-    def release_ip_by_key(self, primary_key):
+    def release_ip_by_handle(self, handle_id):
         """
         Release all addresses assigned to the key.
 
-        :param primary_key:
+        :param handle_id:
         :return: None.
         """
-        pass
+        assert isinstance(handle_id, str)
+        # Read the handle.
+        handle = self._read_handle(handle_id)  # Can throw KeyError, let it.
+
+        # Loop through blocks, releasing.
+        for block_str in handle.block:
+            block_cidr = IPNetwork(block_str)
+            self._release_ip_by_handle_block(handle_id, block_cidr)
+
+    def _release_ip_by_handle_block(self, handle_id, block_cidr):
+        """
+        Release all address in a block with the given handle ID.
+        :param handle_id: The handle ID to find addresses with.
+        :param block_cidr: The block to release addresses on.
+        :return: None
+        """
+        for _ in xrange(RETRIES):
+            try:
+                block = self._read_block(block_cidr)
+            except KeyError:
+                # Block doesn't exist, so all addresses are already
+                # unallocated.  This can happen if the handle is overestimating
+                # the number of assigned addresses, which is a transient, but
+                # expected condition.
+                return
+
+            num_release = block.release_by_handle(handle_id)
+            if num_release == 0:
+                # Block didn't have any addresses with this handle, so all
+                # so all addresses are already unallocated.  This can happen if
+                # the handle is overestimating the number of assigned
+                # addresses, which is a transient, but expected condition.
+                return
+
+            try:
+                self._compare_and_swap_block(block)
+            except CASError:
+                # Failed to update, retry.
+                continue
+
+            # Successfully updated block, update the handle if necessary.
+            if handle_id is not None:
+                # Skip the None handle, it's a special value meaning
+                # the addresses were not allocated with a handle.
+                self._decrement_handle(handle_id, block_cidr, num_release)
+        raise RuntimeError("Hit Max retries.")  # pragma: no cover
 
     def get_assignment_attributes(self, address):
         """

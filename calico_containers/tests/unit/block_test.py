@@ -42,7 +42,7 @@ class TestAllocationBlock(unittest.TestCase):
 
         # Set up an allocation
         attr = {
-            AllocationBlock.ATTR_PRIMARY: "test_key",
+            AllocationBlock.ATTR_HANDLE_ID: "test_key",
             AllocationBlock.ATTR_SECONDARY: {
                 "key1": "value1",
                 "key2": "value2"
@@ -76,14 +76,14 @@ class TestAllocationBlock(unittest.TestCase):
 
         # Build a JSON object for the Block
         attr0 = {
-            AllocationBlock.ATTR_PRIMARY: "test_key1",
+            AllocationBlock.ATTR_HANDLE_ID: "test_key1",
             AllocationBlock.ATTR_SECONDARY: {
                 "key1": "value11",
                 "key2": "value21"
             }
         }
         attr1 = {
-            AllocationBlock.ATTR_PRIMARY: "test_key2",
+            AllocationBlock.ATTR_HANDLE_ID: "test_key2",
             AllocationBlock.ATTR_SECONDARY: {
                 "key1": "value12",
                 "key2": "value22"
@@ -120,14 +120,14 @@ class TestAllocationBlock(unittest.TestCase):
 
         # Build a JSON object for the Block
         attr0 = {
-            AllocationBlock.ATTR_PRIMARY: "test_key1",
+            AllocationBlock.ATTR_HANDLE_ID: "test_key1",
             AllocationBlock.ATTR_SECONDARY: {
                 "key1": "value11",
                 "key2": "value21"
             }
         }
         attr1 = {
-            AllocationBlock.ATTR_PRIMARY: "test_key2",
+            AllocationBlock.ATTR_HANDLE_ID: "test_key2",
             AllocationBlock.ATTR_SECONDARY: {
                 "key1": "value12",
                 "key2": "value22"
@@ -169,7 +169,7 @@ class TestAllocationBlock(unittest.TestCase):
         attr = {"key21": "value1", "key22": "value2"}
         ips = block0.auto_assign(1, "key2", attr)
         assert_list_equal([IPAddress("10.11.12.0")], ips)
-        assert_equal(block0.attributes[0][AllocationBlock.ATTR_PRIMARY],
+        assert_equal(block0.attributes[0][AllocationBlock.ATTR_HANDLE_ID],
                      "key2")
         assert_dict_equal(block0.attributes[0][AllocationBlock.ATTR_SECONDARY],
                           attr)
@@ -180,7 +180,7 @@ class TestAllocationBlock(unittest.TestCase):
         assert_list_equal([IPAddress("10.11.12.1"),
                            IPAddress("10.11.12.2"),
                            IPAddress("10.11.12.3")], ips)
-        assert_equal(block0.attributes[1][AllocationBlock.ATTR_PRIMARY],
+        assert_equal(block0.attributes[1][AllocationBlock.ATTR_HANDLE_ID],
                      "key3")
         assert_dict_equal(block0.attributes[1][AllocationBlock.ATTR_SECONDARY],
                           attr)
@@ -191,7 +191,7 @@ class TestAllocationBlock(unittest.TestCase):
         assert_list_equal([IPAddress("10.11.12.4"),
                            IPAddress("10.11.12.5"),
                            IPAddress("10.11.12.6")], ips)
-        assert_equal(block0.attributes[2][AllocationBlock.ATTR_PRIMARY],
+        assert_equal(block0.attributes[2][AllocationBlock.ATTR_HANDLE_ID],
                      "key3")
         assert_dict_equal(block0.attributes[2][AllocationBlock.ATTR_SECONDARY],
                           {})
@@ -253,7 +253,7 @@ class TestAllocationBlock(unittest.TestCase):
         attr = {"key21": "value1", "key22": "value2"}
         ips = block0.auto_assign(1, "key2", attr)
         assert_list_equal([IPAddress("2001:abcd:def0::")], ips)
-        assert_equal(block0.attributes[0][AllocationBlock.ATTR_PRIMARY],
+        assert_equal(block0.attributes[0][AllocationBlock.ATTR_HANDLE_ID],
                      "key2")
         assert_dict_equal(block0.attributes[0][AllocationBlock.ATTR_SECONDARY],
                           attr)
@@ -264,7 +264,7 @@ class TestAllocationBlock(unittest.TestCase):
         assert_list_equal([IPAddress("2001:abcd:def0::1"),
                            IPAddress("2001:abcd:def0::2"),
                            IPAddress("2001:abcd:def0::3")], ips)
-        assert_equal(block0.attributes[1][AllocationBlock.ATTR_PRIMARY],
+        assert_equal(block0.attributes[1][AllocationBlock.ATTR_HANDLE_ID],
                      "key3")
         assert_dict_equal(block0.attributes[1][AllocationBlock.ATTR_SECONDARY],
                           attr)
@@ -275,7 +275,7 @@ class TestAllocationBlock(unittest.TestCase):
         assert_list_equal([IPAddress("2001:abcd:def0::4"),
                            IPAddress("2001:abcd:def0::5"),
                            IPAddress("2001:abcd:def0::6")], ips)
-        assert_equal(block0.attributes[2][AllocationBlock.ATTR_PRIMARY],
+        assert_equal(block0.attributes[2][AllocationBlock.ATTR_HANDLE_ID],
                      "key3")
         assert_dict_equal(block0.attributes[2][AllocationBlock.ATTR_SECONDARY],
                           {})
@@ -377,7 +377,7 @@ class TestAllocationBlock(unittest.TestCase):
         ip = IPAddress("10.11.12.13")
         block0.assign(ip, None, {})
 
-        err = block0.release({ip})
+        (err, handles) = block0.release({ip})
         assert_set_equal(err, set())
         assert_is_none(block0.allocations[13])
         assert_equal(len(block0.attributes), 1)
@@ -388,7 +388,7 @@ class TestAllocationBlock(unittest.TestCase):
         assert_equal(len(block0.attributes), 2)
 
         # Release half, still 2 unique attrs
-        err = block0.release(set(ips0))
+        (err, handles) = block0.release(set(ips0))
         assert_set_equal(err, set())
         assert_equal(len(block0.attributes), 2)
 
@@ -404,7 +404,7 @@ class TestAllocationBlock(unittest.TestCase):
         assert_equal(block0.allocations[12], 2)
 
         # Release all IPs with 2nd set of attrs, reduced to 2 and renumbered.
-        err = block0.release(set(ips2 + ips1))
+        (err, handles) = block0.release(set(ips2 + ips1))
         assert_set_equal(err, set())
         assert_equal(len(block0.attributes), 2)
         assert_equal(block0.allocations[11], None)
@@ -413,7 +413,7 @@ class TestAllocationBlock(unittest.TestCase):
         # Check that release with already released IP returns the bad IP, but
         # releases the others.
         bad_ips = {IPAddress("10.11.12.0")}
-        err = block0.release(set(ips3).union(bad_ips))
+        (err, handles) = block0.release(set(ips3).union(bad_ips))
         assert_set_equal(err, bad_ips)
         assert_equal(block0.allocations[12], None)
         assert_equal(block0.allocations[13], None)
@@ -427,7 +427,7 @@ class TestAllocationBlock(unittest.TestCase):
         ip = IPAddress("2001:abcd:def0::13")
         block0.assign(ip, None, {})
 
-        err = block0.release({ip})
+        (err, handles) = block0.release({ip})
         assert_set_equal(err, set())
         assert_is_none(block0.allocations[13])
         assert_equal(len(block0.attributes), 1)
@@ -438,7 +438,7 @@ class TestAllocationBlock(unittest.TestCase):
         assert_equal(len(block0.attributes), 2)
 
         # Release half, still 2 unique attrs
-        err = block0.release(set(ips0))
+        (err, handles) = block0.release(set(ips0))
         assert_set_equal(err, set())
         assert_equal(len(block0.attributes), 2)
 
@@ -454,7 +454,7 @@ class TestAllocationBlock(unittest.TestCase):
         assert_equal(block0.allocations[12], 2)
 
         # Release all IPs with 2nd set of attrs, reduced to 2 and renumbered.
-        err = block0.release(set(ips2 + ips1))
+        (err, handles) = block0.release(set(ips2 + ips1))
         assert_set_equal(err, set())
         assert_equal(len(block0.attributes), 2)
         assert_equal(block0.allocations[11], None)
@@ -463,7 +463,7 @@ class TestAllocationBlock(unittest.TestCase):
         # Check that release with already released IP returns the bad IP, but
         # releases the others.
         bad_ips = {IPAddress("2001:abcd:def0::")}
-        err = block0.release(set(ips3).union(bad_ips))
+        (err, handles) = block0.release(set(ips3).union(bad_ips))
         assert_set_equal(err, bad_ips)
         assert_equal(block0.allocations[12], None)
         assert_equal(block0.allocations[13], None)
@@ -497,7 +497,7 @@ def _test_block_empty_v4():
 def _test_block_not_empty_v4():
     block = _test_block_empty_v4()
 
-    attr = {AllocationBlock.ATTR_PRIMARY: "key1",
+    attr = {AllocationBlock.ATTR_HANDLE_ID: "key1",
             AllocationBlock.ATTR_SECONDARY: {"key21": "value1",
                                              "key22": "value2"}}
     block.attributes.append(attr)
@@ -514,7 +514,7 @@ def _test_block_empty_v6():
 def _test_block_not_empty_v6():
     block = _test_block_empty_v6()
 
-    attr = {AllocationBlock.ATTR_PRIMARY: "key1",
+    attr = {AllocationBlock.ATTR_HANDLE_ID: "key1",
             AllocationBlock.ATTR_SECONDARY: {"key21": "value1",
                                              "key22": "value2"}}
     block.attributes.append(attr)
