@@ -369,7 +369,7 @@ def _handle_datastore_key(handle_id):
 class IPAMClient(BlockHandleReaderWriter):
 
     def auto_assign_ips(self, num_v4, num_v6, handle_id, attributes,
-                        pool=(None, None)):
+                        pool=(None, None), hostname=my_hostname):
         """
         Automatically pick and assign the given number of IPv4 and IPv6
         addresses.
@@ -384,6 +384,9 @@ class IPAMClient(BlockHandleReaderWriter):
         JSON serializable.
         :param pool: (optional) tuple of (v4 pool, v6 pool); if supplied, the
         pool(s) to assign from,  If None, automatically choose a pool.
+        :param hostname: (optional) the hostname to use for affinity in
+        assigning IP addresses.  Defaults to the local hostname as returned by
+        socket.gethostname().
         :return: A tuple of (v4_address_list, v6_address_list).  When IPs in
         configured pools are at or near exhaustion, this method may return
         fewer than requested addresses.
@@ -391,12 +394,13 @@ class IPAMClient(BlockHandleReaderWriter):
         assert isinstance(handle_id, str) or handle_id is None
 
         v4_address_list = self._auto_assign(4, num_v4, handle_id,
-                                            attributes, pool[0])
+                                            attributes, pool[0], hostname)
         v6_address_list = self._auto_assign(6, num_v6, handle_id,
-                                            attributes, pool[1])
+                                            attributes, pool[1], hostname)
         return v4_address_list, v6_address_list
 
-    def _auto_assign(self, ip_version, num, handle_id, attributes, pool):
+    def _auto_assign(self, ip_version, num, handle_id,
+                     attributes, pool, hostname):
         """
         Auto assign addresses from a specific IP version.
 
@@ -416,11 +420,13 @@ class IPAMClient(BlockHandleReaderWriter):
         be JSON serializable.
         :param pool: (optional) if supplied, the pool to assign from,  If None,
         automatically choose a pool.
+        :param hostname: The hostname to use for affinity in assigning IP
+        addresses.
         :return:
         """
         assert isinstance(handle_id, str) or handle_id is None
 
-        block_list = self._get_affine_blocks(my_hostname,
+        block_list = self._get_affine_blocks(hostname,
                                              ip_version,
                                              pool)
         block_ids = iter(block_list)
@@ -446,7 +452,7 @@ class IPAMClient(BlockHandleReaderWriter):
         while num_remaining > 0 and retries > 0:
             retries -= 1
             try:
-                new_block = self._new_affine_block(my_hostname,
+                new_block = self._new_affine_block(hostname,
                                                    ip_version,
                                                    pool)
                 # If successful, this creates the block and registers it to us.
@@ -534,7 +540,7 @@ class IPAMClient(BlockHandleReaderWriter):
                 return unconfirmed_ips
         raise RuntimeError("Hit Max Retries.")  # pragma: no cover
 
-    def assign_ip(self, address, handle_id, attributes):
+    def assign_ip(self, address, handle_id, attributes, hostname=my_hostname):
         """
         Assign the given address.  Throws AlreadyAssignedError if the address
         is taken.
@@ -546,6 +552,9 @@ class IPAMClient(BlockHandleReaderWriter):
         :param attributes: Contents of this dict will be stored with the
         assignment and can be queried using get_assignment_attributes().  Must
         be JSON serializable.
+        :param hostname: (optional) the hostname to use for affinity if the
+        block containing the IP address has no host affinity.  Defaults to the
+        local hostname as returned by socket.gethostname().
         :return: None.
         """
         assert isinstance(handle_id, str) or handle_id is None
@@ -561,7 +570,7 @@ class IPAMClient(BlockHandleReaderWriter):
                 if any([address in pool for pool in pools]):
                     # Address is in a pool.  Create and claim the block.
                     try:
-                        self._claim_block_affinity(my_hostname,
+                        self._claim_block_affinity(hostname,
                                                    block_cidr)
                     except KeyError:
                         # Happens if something else claims the block between
