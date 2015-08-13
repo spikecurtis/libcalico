@@ -48,7 +48,7 @@ class AllocationBlock(object):
     HOST_AFFINITY_T = "host:%s"
     ALLOCATIONS = "allocations"
     ATTRIBUTES = "attributes"
-    ATTR_PRIMARY = "primary"
+    ATTR_HANDLE_ID = "handle_id"
     ATTR_SECONDARY = "secondary"
 
     def __init__(self, cidr_prefix, host_affinity):
@@ -138,20 +138,20 @@ class AllocationBlock(object):
         self.db_result.value = self.to_json()
         return self.db_result
 
-    def auto_assign(self, num, primary_key, attributes, affinity_check=True):
+    def auto_assign(self, num, handle_id, attributes, affinity_check=True):
         """
         Automatically pick and assign the given number of IP addresses.
 
         :param num: Number of addresses to request
-        :param primary_key: allocation primary key for this request.  You can
-        query this key using get_assignments_by_key() or release all addresses
-        with this key using release_by_key().
+        :param handle_id: allocation handle ID for this request.  You can
+        query this key using get_assignments_by_handle() or release all
+        addresses with this key using release_by_handle().
         :param attributes: Contents of this dict will be stored with the
         assignment and can be queried using get_assignment_attributes().  Must
         be JSON serializable.
-        :param affinity_check: If true, verify that this block's affinity is this
-        host and throw a NoHostAffinityWarning if it isn't.  Set to false to
-        disable this check.
+        :param affinity_check: If true, verify that this block's affinity is
+        this host and throw a NoHostAffinityWarning if it isn't.  Set to false
+        to disable this check.
         :return: List of assigned addresses.  When the block is at or near
         full, this method may return fewer than requested IPs.
         """
@@ -172,7 +172,7 @@ class AllocationBlock(object):
         ips = []
         if ordinals:
             # We found some addresses, now we need to set up attributes.
-            attr_index = self._find_or_add_attrs(primary_key, attributes)
+            attr_index = self._find_or_add_attrs(handle_id, attributes)
 
             # Perform the allocation.
             for o in ordinals:
@@ -184,15 +184,15 @@ class AllocationBlock(object):
                 ips.append(ip)
         return ips
 
-    def assign(self, address, primary_key, attributes):
+    def assign(self, address, handle_id, attributes):
         """
         Assign the given address.  Throws AlreadyAssignedError if the address
         is taken.
 
         :param address: IPAddress to assign.
-        :param primary_key: allocation primary key for this request.  You can
-        query this key using get_assignments_by_key() or release all addresses
-        with this key using release_by_key().
+        :param handle_id: allocation handle ID for this request.  You can
+        query this key using get_assignments_by_handle() or release all addresses
+        with this key using release_by_handle().
         :param attributes: Contents of this dict will be stored with the
         assignment and can be queried using get_assignment_attributes().  Must
         be JSON serializable.
@@ -209,7 +209,7 @@ class AllocationBlock(object):
                 address, self.cidr))
 
         # Set up attributes
-        attr_index = self._find_or_add_attrs(primary_key, attributes)
+        attr_index = self._find_or_add_attrs(handle_id, attributes)
         self.allocations[ordinal] = attr_index
         return
 
@@ -229,14 +229,19 @@ class AllocationBlock(object):
         Release the given addresses.
 
         :param addresses: Set of IPAddresses to release.
-        :return: Set of IPAddresses.  If any of the requested addresses were
-        not allocated, they are returned so the caller can handle
-        appropriately.
+        :return: (unallocated, handles_with_counts) Where:
+          - unallocted is a set of IPAddresses.  If any of the requested
+            addresses were not allocated, they are returned so the caller can
+            handle appropriately.
+          - handles_with_counts is a dictionary of handle_ids and the number of
+            addresses released for that handle.  They are returned so the
+            caller can decrement the affected handles.
         """
         assert isinstance(addresses, (set, frozenset))
         deleting_ref_counts = {}
         ordinals = []
         unallocated = set()
+        handles_with_counts = {}
         for address in addresses:
             assert isinstance(address, IPAddress)
             # Convert to an ordinal
@@ -253,6 +258,13 @@ class AllocationBlock(object):
             ordinals.append(ordinal)
             old_count = deleting_ref_counts.get(attr_idx, 0)
             deleting_ref_counts[attr_idx] = old_count + 1
+
+            # Increment our count of addresses by handle.
+            handle_id = self.\
+                attributes[attr_idx][AllocationBlock.ATTR_HANDLE_ID]
+            handle_count = handles_with_counts.setdefault(handle_id, 0)
+            handle_count += 1
+            handles_with_counts[handle_id] = handle_count
 
         # Compute which attributes need to be cleaned up.  We do this by
         # reference counting.  If we're deleting all the references, then it
@@ -272,7 +284,84 @@ class AllocationBlock(object):
         for ordinal in ordinals:
             self.allocations[ordinal] = None
 
-        return unallocated
+        return unallocated, handles_with_counts
+
+    def release_by_handle(self, handle_id):
+        """
+        Release all addresses with the given handle ID.
+        :param handle_id: The handle ID to release.
+        :return: Number of addresses released.
+        """
+        attr_indexes_to_delete = self._get_attr_indexes_by_handle(handle_id)
+
+        if attr_indexes_to_delete:
+            # Get the ordinals of IPs to release
+            ordinals = []
+            for o in xrange(BLOCK_SIZE):
+                if self.allocations[o] in attr_indexes_to_delete:
+                    ordinals.append(o)
+
+            # Clean and renumber remaining attributes.
+            self._delete_attributes(attr_indexes_to_delete, ordinals)
+
+            # Release the addresses.
+            for ordinal in ordinals:
+                self.allocations[ordinal] = None
+            return len(ordinals)
+        else:
+            # Nothing to release.
+            return 0
+
+    def get_ip_assignments_by_handle(self, handle_id):
+        """
+        Get the IP Addresses assigned to a particular handle.
+        :param handle_id: The handle ID to search for.
+        :return: List of IPAddress objects.
+        """
+        attr_indexes = self._get_attr_indexes_by_handle(handle_id)
+        ips = []
+        for o in xrange(BLOCK_SIZE):
+                if self.allocations[o] in attr_indexes:
+                    ip = IPAddress(self.cidr.first + o,
+                                   version=self.cidr.version)
+                    ips.append(ip)
+        return ips
+
+    def get_attributes_for_ip(self, address):
+        """
+        Get the attributes and handle ID for an IP address.
+
+        :param address: The IPAddress object to query.
+        :return: (handle_id, attributes)
+        """
+        assert isinstance(address, IPAddress)
+        # Convert to an ordinal
+        ordinal = int(address - self.cidr.first)
+        assert 0 <= ordinal <= BLOCK_SIZE, "Address not in block."
+
+        # Check if allocated
+        attr_index = self.allocations[ordinal]
+        if attr_index is None:
+            raise AddressNotAssignedError("%s is not assigned in block %s" % (
+                address, self.cidr))
+        else:
+            # Allocated.  Look up attributes.
+            assert isinstance(attr_index, int)
+            attr = self.attributes[attr_index]
+            return (attr[AllocationBlock.ATTR_HANDLE_ID],
+                    attr[AllocationBlock.ATTR_SECONDARY])
+
+    def _get_attr_indexes_by_handle(self, handle_id):
+        """
+        Get the attribute indexes for a given handle.
+        :param handle_id: The handle ID to search for.
+        :return: List of attribute indexes.
+        """
+        attr_indexes = []
+        for ii, attr in enumerate(self.attributes):
+            if attr[AllocationBlock.ATTR_HANDLE_ID] == handle_id:
+                attr_indexes.append(ii)
+        return attr_indexes
 
     def _delete_attributes(self, attr_indexes_to_delete, ordinals):
         """
@@ -326,7 +415,7 @@ class AllocationBlock(object):
         """
         assert json.dumps(attributes), \
             "Attributes aren't JSON serializable."
-        attr = {AllocationBlock.ATTR_PRIMARY: primary_key,
+        attr = {AllocationBlock.ATTR_HANDLE_ID: primary_key,
                 AllocationBlock.ATTR_SECONDARY: attributes}
         attr_index = None
         for index, exist_attr in enumerate(self.attributes):
@@ -386,5 +475,12 @@ class NoHostAffinityWarning(Exception):
 class AlreadyAssignedError(Exception):
     """
     Tried to assign an address, but the address is already taken.
+    """
+    pass
+
+
+class AddressNotAssignedError(Exception):
+    """
+    Tried to query an address that isn't assigned.
     """
     pass

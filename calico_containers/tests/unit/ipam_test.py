@@ -18,9 +18,10 @@ import unittest
 import json
 from etcd import EtcdResult, Client, EtcdAlreadyExist, EtcdKeyNotFound
 
-from pycalico.ipam import (IPAMClient, BlockReaderWriter,
-                           CASError, NoFreeBlocksError, _datastore_key)
+from pycalico.ipam import (IPAMClient, BlockHandleReaderWriter,
+                           CASError, NoFreeBlocksError, _block_datastore_key)
 from pycalico.block import AllocationBlock
+from pycalico.handle import AllocationHandle
 from pycalico.datastore_datatypes import IPPool
 from block_test import _test_block_empty_v4, _test_block_empty_v6
 
@@ -49,7 +50,7 @@ class TestIPAMClient(unittest.TestCase):
         m_result.value = block.to_json()
         self.m_etcd_client.read.return_value = m_result
 
-        with patch("pycalico.ipam.BlockReaderWriter._get_affine_blocks",
+        with patch("pycalico.ipam.BlockHandleReaderWriter._get_affine_blocks",
                    m_get_affine_blocks):
             (ipv4s, ipv6s) = self.client.auto_assign_ips(1, 0, None, {})
             assert_list_equal([IPAddress("10.11.12.0")], ipv4s)
@@ -77,7 +78,7 @@ class TestIPAMClient(unittest.TestCase):
         m_result1.value = block1.to_json()
         self.m_etcd_client.read.side_effect = [m_result0, m_result1]
 
-        with patch("pycalico.ipam.BlockReaderWriter._get_affine_blocks",
+        with patch("pycalico.ipam.BlockHandleReaderWriter._get_affine_blocks",
                    m_get_affine_blocks):
             (ipv4s, ipv6s) = self.client.auto_assign_ips(1, 2, None, {})
             assert_list_equal([IPAddress("10.11.12.0")], ipv4s)
@@ -104,7 +105,7 @@ class TestIPAMClient(unittest.TestCase):
 
         self.m_etcd_client.read.side_effect = [m_result0, m_result1]
 
-        with patch("pycalico.ipam.BlockReaderWriter._get_affine_blocks",
+        with patch("pycalico.ipam.BlockHandleReaderWriter._get_affine_blocks",
                    m_get_affine_blocks):
             (ipv4s, ipv6s) = self.client.auto_assign_ips(1, 0, None, {})
             assert_list_equal([IPAddress("10.11.45.0")], ipv4s)
@@ -131,7 +132,7 @@ class TestIPAMClient(unittest.TestCase):
 
         self.m_etcd_client.read.side_effect = [m_result0, m_result1]
 
-        with patch("pycalico.ipam.BlockReaderWriter._get_affine_blocks",
+        with patch("pycalico.ipam.BlockHandleReaderWriter._get_affine_blocks",
                    m_get_affine_blocks):
             (ipv4s, ipv6s) = self.client.auto_assign_ips(4, 0, None, {})
             assert_list_equal([IPAddress("10.11.12.254"),
@@ -171,7 +172,7 @@ class TestIPAMClient(unittest.TestCase):
         self.m_etcd_client.read.side_effect = [m_result0, m_result1,
                                                m_result0, m_result1]
 
-        with patch("pycalico.ipam.BlockReaderWriter._get_affine_blocks",
+        with patch("pycalico.ipam.BlockHandleReaderWriter._get_affine_blocks",
                    m_get_affine_blocks),\
              patch("pycalico.datastore.DatastoreClient.get_ip_pools",
                    m_get_ip_pools):
@@ -210,7 +211,7 @@ class TestIPAMClient(unittest.TestCase):
                                                  None,
                                                  None]
 
-        with patch("pycalico.ipam.BlockReaderWriter._get_affine_blocks",
+        with patch("pycalico.ipam.BlockHandleReaderWriter._get_affine_blocks",
                    m_get_affine_blocks):
             (ipv4s, ipv6s) = self.client.auto_assign_ips(4, 0, None, {})
             assert_list_equal([IPAddress("10.11.12.255"),
@@ -245,7 +246,7 @@ class TestIPAMClient(unittest.TestCase):
         self.m_etcd_client.read.side_effect = [EtcdKeyNotFound(), m_result]
 
 
-        with patch("pycalico.ipam.BlockReaderWriter._get_affine_blocks",
+        with patch("pycalico.ipam.BlockHandleReaderWriter._get_affine_blocks",
                    m_get_affine_blocks),\
              patch("pycalico.datastore.DatastoreClient.get_ip_pools",
                    m_get_ip_pools):
@@ -285,11 +286,11 @@ class TestIPAMClient(unittest.TestCase):
         def m_get_ip_pools(self, version):
             return [IPPool("10.11.0.0/18")]
 
-        with patch("pycalico.ipam.BlockReaderWriter._get_affine_blocks",
+        with patch("pycalico.ipam.BlockHandleReaderWriter._get_affine_blocks",
                    m_get_affine_blocks),\
              patch("pycalico.datastore.DatastoreClient.get_ip_pools",
                    m_get_ip_pools),\
-             patch("pycalico.ipam.BlockReaderWriter._read_block",
+             patch("pycalico.ipam.BlockHandleReaderWriter._read_block",
                    m_read_block):
             (ipv4s, ipv6s) = self.client.auto_assign_ips(4, 0, None, {})
             assert_equal(len(ipv4s), 4)
@@ -499,7 +500,7 @@ class TestIPAMClient(unittest.TestCase):
                 return block6
             assert_true(False, "Unexpected block CIDR")
 
-        with patch("pycalico.ipam.BlockReaderWriter._read_block",
+        with patch("pycalico.ipam.BlockHandleReaderWriter._read_block",
                    m_read_block):
             ips = {ip4, ip6}
             err = self.client.release_ips(ips)
@@ -528,7 +529,7 @@ class TestIPAMClient(unittest.TestCase):
                 return block6
             assert_true(False, "Unexpected block CIDR")
 
-        with patch("pycalico.ipam.BlockReaderWriter._read_block",
+        with patch("pycalico.ipam.BlockHandleReaderWriter._read_block",
                    m_read_block):
             ips = {ip4, ip6}
             err = self.client.release_ips(ips)
@@ -552,7 +553,7 @@ class TestIPAMClient(unittest.TestCase):
                 return block6
             assert_true(False, "Unexpected block CIDR")
 
-        with patch("pycalico.ipam.BlockReaderWriter._read_block",
+        with patch("pycalico.ipam.BlockHandleReaderWriter._read_block",
                    m_read_block):
             ips = {ip4, ip6}
             err = self.client.release_ips(ips)
@@ -585,7 +586,7 @@ class TestIPAMClient(unittest.TestCase):
                 return block6
             assert_true(False, "Unexpected block CIDR")
 
-        with patch("pycalico.ipam.BlockReaderWriter._read_block",
+        with patch("pycalico.ipam.BlockHandleReaderWriter._read_block",
                    m_read_block):
             ips = ip4s.union(ip6s)
             err = self.client.release_ips(ips)
@@ -637,9 +638,9 @@ class TestIPAMClient(unittest.TestCase):
                 else:
                     return
 
-        with patch("pycalico.ipam.BlockReaderWriter._read_block",
+        with patch("pycalico.ipam.BlockHandleReaderWriter._read_block",
                    m_read_block),\
-             patch("pycalico.ipam.BlockReaderWriter._compare_and_swap_block",
+             patch("pycalico.ipam.BlockHandleReaderWriter._compare_and_swap_block",
                    m_compare_and_swap_block):
             ips = {ip4, ip6}
             err = self.client.release_ips(ips)
@@ -661,7 +662,7 @@ class TestIPAMClient(unittest.TestCase):
                 return block4
             assert_true(False, "Unexpected block CIDR")
 
-        with patch("pycalico.ipam.BlockReaderWriter._read_block",
+        with patch("pycalico.ipam.BlockHandleReaderWriter._read_block",
                    m_read_block):
             pool = IPPool("10.11.0.0/16")
             success = self.client.unassign_address(pool, ip4)
@@ -682,7 +683,7 @@ class TestIPAMClient(unittest.TestCase):
                 return block4
             assert_true(False, "Unexpected block CIDR")
 
-        with patch("pycalico.ipam.BlockReaderWriter._read_block",
+        with patch("pycalico.ipam.BlockHandleReaderWriter._read_block",
                    m_read_block):
             pool = IPPool("10.11.0.0/16")
             success = self.client.unassign_address(pool, ip4)
@@ -691,10 +692,10 @@ class TestIPAMClient(unittest.TestCase):
         assert_false(self.m_etcd_client.update.called)
 
 
-class TestBlockReaderWriter(unittest.TestCase):
+class TestBlockHandleReaderWriter(unittest.TestCase):
 
     def setUp(self):
-        self.client = BlockReaderWriter()
+        self.client = BlockHandleReaderWriter()
         self.m_etcd_client = Mock(spec=Client)
         self.client.etcd_client = self.m_etcd_client
 
@@ -797,7 +798,7 @@ class TestBlockReaderWriter(unittest.TestCase):
         self.client._claim_block_affinity(block.host_affinity,
                                           block.cidr)
 
-        key = _datastore_key(block.cidr)
+        key = _block_datastore_key(block.cidr)
         value = block.to_json()
         self.m_etcd_client.write.assert_has_calls([call(ANY, ""),
                                                    call(key, value,
@@ -847,13 +848,13 @@ class TestBlockReaderWriter(unittest.TestCase):
             assert_equal(cidr, IPNetwork("10.11.1.0/24"))
 
             # 1st block write is the .0.0 block, but with test_host2 affinity.
-            key0 = _datastore_key(block.cidr)
+            key0 = _block_datastore_key(block.cidr)
             block.host_affinity = "test_host2"
             value0 = block.to_json()
 
             # 2nd block write is the .1.0 block.
             block1 = AllocationBlock(cidr, "test_host2")
-            key1 = _datastore_key(cidr)
+            key1 = _block_datastore_key(cidr)
             value1 = block1.to_json()
 
             self.m_etcd_client.write.assert_has_calls([
@@ -900,7 +901,7 @@ class TestBlockReaderWriter(unittest.TestCase):
 
             # Spot check last call is the last subnet in 10.11.0.0/16 pool.
             assert_equal(self.m_etcd_client.read.call_args[0][0],
-                         _datastore_key(IPNetwork("10.11.255.0/24")))
+                         _block_datastore_key(IPNetwork("10.11.255.0/24")))
 
     def test_random_blocks(self):
         """
@@ -986,8 +987,153 @@ class TestBlockReaderWriter(unittest.TestCase):
             assert_in(IPNetwork("10.11.0.255/24"), random_blocks)
             assert_in(IPNetwork("10.11.0.127/24"), random_blocks)
 
+    def test_increment_handle_exists(self):
+        """
+        Test _increment_handle() when the handle exists.
 
+        """
 
+        handle_id = "handle_id_1"
+        block_cidr = IPNetwork("10.11.12.0/24")
+        amount = 10
 
+        handle = AllocationHandle(handle_id)
+        m_result = Mock(spec=EtcdResult)
+        m_result.value = handle.to_json()
+        self.m_etcd_client.read.return_value = m_result
+
+        self.client._increment_handle(handle_id, block_cidr, amount)
+
+        assert_equal(self.m_etcd_client.read.call_count, 1)
+        self.m_etcd_client.update.assert_called_once_with(m_result)
+
+        # Verify we incremented the handle.
+        handle2 = AllocationHandle.from_etcd_result(m_result)
+        assert_equal(handle2.decrement_block(block_cidr, amount), 0)
+
+    def test_increment_handle_doesnt_exist(self):
+        """
+        Test _increment_handle() when the handle doesn't exist.
+
+        """
+
+        handle_id = "handle_id_1"
+        block_cidr = IPNetwork("10.11.12.0/24")
+        amount = 10
+
+        self.m_etcd_client.read.side_effect = EtcdKeyNotFound()
+
+        self.client._increment_handle(handle_id, block_cidr, amount)
+
+        assert_equal(self.m_etcd_client.read.call_count, 1)
+
+        handle = AllocationHandle(handle_id)
+        handle.increment_block(block_cidr, amount)
+        self.m_etcd_client.write.assert_called_once_with(ANY,
+                                                         handle.to_json(),
+                                                         prevExist=False)
+
+    def test_increment_handle_exists_cas_error(self):
+        """
+        Test _increment_handle() when it exists, but there is a CAS error.
+
+        """
+
+        handle_id = "handle_id_1"
+        block_cidr = IPNetwork("10.11.12.0/24")
+        amount = 10
+
+        handle0 = AllocationHandle(handle_id)
+        m_result0 = Mock(spec=EtcdResult)
+        m_result0.value = handle0.to_json()
+
+        handle1 = AllocationHandle(handle_id)
+        m_result1 = Mock(spec=EtcdResult)
+        m_result1.value = handle1.to_json()
+        self.m_etcd_client.read.side_effect = [m_result0, m_result1]
+
+        # Fail, then success.
+        self.m_etcd_client.update.side_effect = [CASError(),
+                                                 None]
+
+        self.client._increment_handle(handle_id, block_cidr, amount)
+
+        assert_equal(self.m_etcd_client.read.call_count, 2)
+        assert_equal(self.m_etcd_client.update.call_count, 2)
+
+        # Verify we incremented the handle.
+        handle2 = AllocationHandle.from_etcd_result(m_result1)
+        assert_equal(handle2.decrement_block(block_cidr, amount), 0)
+
+    def test_increment_handle_doesnt_exist_cas_error(self):
+        """
+        Test _increment_handle() when it doesn't exist, but there is a CAS
+        error.
+        """
+        handle_id = "handle_id_1"
+        block_cidr = IPNetwork("10.11.12.0/24")
+        amount = 10
+
+        handle1 = AllocationHandle(handle_id)
+        m_result1 = Mock(spec=EtcdResult)
+        m_result1.value = handle1.to_json()
+        self.m_etcd_client.read.side_effect = [EtcdKeyNotFound(), m_result1]
+
+        # Write fails, update succeeds.
+        self.m_etcd_client.write.side_effect = CASError()
+
+        self.client._increment_handle(handle_id, block_cidr, amount)
+
+        assert_equal(self.m_etcd_client.read.call_count, 2)
+        assert_equal(self.m_etcd_client.write.call_count, 1)
+        self.m_etcd_client.update.assert_called_once_with(m_result1)
+
+        # Verify we incremented the handle.
+        handle2 = AllocationHandle.from_etcd_result(m_result1)
+        assert_equal(handle2.decrement_block(block_cidr, amount), 0)
+
+    def test_decrement_handle_exists(self):
+        """
+        Test _decrement_handle when it exists.
+        """
+
+        handle_id = "handle_id_1"
+        block_cidr = IPNetwork("10.11.12.0/24")
+        amount = 10
+
+        handle0 = AllocationHandle(handle_id)
+        handle0.increment_block(block_cidr, amount*2)
+        m_result0 = Mock(spec=EtcdResult)
+        m_result0.value = handle0.to_json()
+
+        self.m_etcd_client.read.return_value = m_result0
+
+        self.client._decrement_handle(handle_id, block_cidr, amount)
+        self.m_etcd_client.update.assert_called_once_with(m_result0)
+
+        # Assert we decremented the handle
+        handle2 = AllocationHandle.from_etcd_result(m_result0)
+        assert_equal(handle2.decrement_block(block_cidr, amount), 0)
+
+    def test_decrement_handle_empty(self):
+        """
+        Test _decrement_handle when it empties the handle.
+        """
+
+        handle_id = "handle_id_1"
+        block_cidr = IPNetwork("10.11.12.0/24")
+        amount = 10
+
+        handle0 = AllocationHandle(handle_id)
+        handle0.increment_block(block_cidr, amount)
+        m_result0 = Mock(spec=EtcdResult)
+        m_result0.value = handle0.to_json()
+        m_result0.modifiedIndex = 55555
+
+        self.m_etcd_client.read.return_value = m_result0
+
+        self.client._decrement_handle(handle_id, block_cidr, amount)
+        self.m_etcd_client.delete.assert_called_once_with(ANY,
+                                                          prevIndex=55555)
 
 
