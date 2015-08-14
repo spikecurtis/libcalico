@@ -27,7 +27,8 @@ from pycalico.datastore_errors import PoolNotFound
 from pycalico.block import (AllocationBlock,
                             get_block_cidr_for_address,
                             BLOCK_PREFIXLEN,
-                            AlreadyAssignedError)
+                            AlreadyAssignedError,
+                            AddressNotAssignedError)
 from pycalico.handle import (AllocationHandle,
                              AddressCountTooLow)
 
@@ -669,20 +670,35 @@ class IPAMClient(BlockHandleReaderWriter):
     def get_ip_assignments_by_handle(self, handle_id):
         """
         Return a list of IPAddresses assigned to the key.
-        :param handle_id: Key to query e.g. used on assign() or auto_assign().
+        :param handle_id: Key to query e.g. used on assign_ip() or
+        auto_assign_ips().
         :return: List of IPAddresses
         """
         assert isinstance(handle_id, str)
+        handle = self._read_handle(handle_id)  # Can throw KeyError, let it.
+
+        ip_assignments = []
+        for block_str in handle.block:
+            block_cidr = IPNetwork(block_str)
+            try:
+                block = self._read_block(block_cidr)
+            except KeyError:
+                _log.warning("Couldn't read block %s referenced in handle %s.",
+                             block_str, handle_id)
+                continue
+            ips = block.get_ip_assignments_by_handle(handle_id)
+            ip_assignments.extend(ips)
+        return ip_assignments
 
     def release_ip_by_handle(self, handle_id):
         """
         Release all addresses assigned to the key.
 
-        :param handle_id:
+        :param handle_id: Key to query, e.g. used on assign_ip() or
+        auto_assign_ips().
         :return: None.
         """
         assert isinstance(handle_id, str)
-        # Read the handle.
         handle = self._read_handle(handle_id)  # Can throw KeyError, let it.
 
         # Loop through blocks, releasing.
@@ -736,7 +752,18 @@ class IPAMClient(BlockHandleReaderWriter):
         :return: The attributes for the address as passed to auto_assign() or
         assign().
         """
-        pass
+        assert isinstance(address, IPAddress)
+        block_cidr = get_block_cidr_for_address(address)
+
+        try:
+            block = self._read_block(block_cidr)
+        except KeyError:
+            _log.warning("Couldn't read block %s for requested address %s",
+                         block_cidr, address)
+            raise AddressNotAssignedError("%s is not assigned." % address)
+        else:
+            _, attributes = block.get_attributes_for_ip(address)
+            return attributes
 
     def assign_address(self, pool, address):
         """

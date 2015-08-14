@@ -292,11 +292,7 @@ class AllocationBlock(object):
         :param handle_id: The handle ID to release.
         :return: Number of addresses released.
         """
-        # Get the attribute indexes of the addresses to release.
-        attr_indexes_to_delete = []
-        for ii, attr in enumerate(self.attributes):
-            if attr[AllocationBlock.ATTR_HANDLE_ID] == handle_id:
-                attr_indexes_to_delete.append(ii)
+        attr_indexes_to_delete = self._get_attr_indexes_by_handle(handle_id)
 
         if attr_indexes_to_delete:
             # Get the ordinals of IPs to release
@@ -315,6 +311,57 @@ class AllocationBlock(object):
         else:
             # Nothing to release.
             return 0
+
+    def get_ip_assignments_by_handle(self, handle_id):
+        """
+        Get the IP Addresses assigned to a particular handle.
+        :param handle_id: The handle ID to search for.
+        :return: List of IPAddress objects.
+        """
+        attr_indexes = self._get_attr_indexes_by_handle(handle_id)
+        ips = []
+        for o in xrange(BLOCK_SIZE):
+                if self.allocations[o] in attr_indexes:
+                    ip = IPAddress(self.cidr.first + o,
+                                   version=self.cidr.version)
+                    ips.append(ip)
+        return ips
+
+    def get_attributes_for_ip(self, address):
+        """
+        Get the attributes and handle ID for an IP address.
+
+        :param address: The IPAddress object to query.
+        :return: (handle_id, attributes)
+        """
+        assert isinstance(address, IPAddress)
+        # Convert to an ordinal
+        ordinal = int(address - self.cidr.first)
+        assert 0 <= ordinal <= BLOCK_SIZE, "Address not in block."
+
+        # Check if allocated
+        attr_index = self.allocations[ordinal]
+        if attr_index is None:
+            raise AddressNotAssignedError("%s is not assigned in block %s" % (
+                address, self.cidr))
+        else:
+            # Allocated.  Look up attributes.
+            assert isinstance(attr_index, int)
+            attr = self.attributes[attr_index]
+            return (attr[AllocationBlock.ATTR_HANDLE_ID],
+                    attr[AllocationBlock.ATTR_SECONDARY])
+
+    def _get_attr_indexes_by_handle(self, handle_id):
+        """
+        Get the attribute indexes for a given handle.
+        :param handle_id: The handle ID to search for.
+        :return: List of attribute indexes.
+        """
+        attr_indexes = []
+        for ii, attr in enumerate(self.attributes):
+            if attr[AllocationBlock.ATTR_HANDLE_ID] == handle_id:
+                attr_indexes.append(ii)
+        return attr_indexes
 
     def _delete_attributes(self, attr_indexes_to_delete, ordinals):
         """
@@ -428,5 +475,12 @@ class NoHostAffinityWarning(Exception):
 class AlreadyAssignedError(Exception):
     """
     Tried to assign an address, but the address is already taken.
+    """
+    pass
+
+
+class AddressNotAssignedError(Exception):
+    """
+    Tried to query an address that isn't assigned.
     """
     pass
