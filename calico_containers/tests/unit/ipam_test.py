@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import copy
 from netaddr import IPNetwork, IPAddress
 from nose.tools import *
 from mock import patch, ANY, call, Mock
@@ -19,9 +20,11 @@ import json
 from etcd import EtcdResult, Client, EtcdAlreadyExist, EtcdKeyNotFound
 
 from pycalico.ipam import (IPAMClient, BlockHandleReaderWriter,
-                           CASError, NoFreeBlocksError, _block_datastore_key)
+                           CASError, NoFreeBlocksError, _block_datastore_key,
+                           _handle_datastore_key)
+from pycalico.datastore_errors import PoolNotFound
 from pycalico.block import AllocationBlock
-from pycalico.handle import AllocationHandle
+from pycalico.handle import AllocationHandle, AddressCountTooLow
 from pycalico.datastore_datatypes import IPPool
 from block_test import _test_block_empty_v4, _test_block_empty_v6
 
@@ -220,6 +223,97 @@ class TestIPAMClient(unittest.TestCase):
                                IPAddress("10.11.45.2")], ipv4s)
 
     @patch("pycalico.block.my_hostname", "test_host1")
+    def test_auto_assign_with_handle_cas_failure(self):
+        """
+        Test of auto assign with a new handle, and transient CAS errors.
+        """
+
+        def m_get_affine_blocks(self, host, ip_version, pool):
+            return [IPNetwork("10.11.12.0/24"),
+                    IPNetwork("10.11.45.0/24")]
+
+        # Initialise the block assignment.
+        block = _test_block_empty_v4()
+        m_resultb = Mock(spec=EtcdResult)
+        m_resultb.value = block.to_json()
+        m_resultb.key = "/calico/ipam/v1/assignment/ipv4/block/10.11.12.0-24"
+
+        # Initialise the handle assignment
+        handle_id = "handle_id_1"
+        handle0 = AllocationHandle(handle_id)
+        handle0.increment_block(IPNetwork("10.11.12.0/24"), 1)
+        m_resulth = Mock(spec=EtcdResult)
+        m_resulth.value = handle0.to_json()
+        m_resulth.key = _handle_datastore_key(handle_id)
+        m_resulth.modifiedIndex = 55555
+
+        # Read returns appropriate result based on key.
+        read_results = {m_resultb.key: m_resultb,
+                        m_resulth.key: m_resulth}
+        def read(key):
+            """ Return a copy of the current stored value depending on key."""
+            return copy.copy(read_results[key])
+        self.m_etcd_client.read.side_effect = read
+
+        # Fail the block updates a couple of times and then succeed.
+        # Similarly fail one of the handle updates.  For each failed block
+        # update the handle will be incremented and decremented, for the
+        # successful block update, the handle will be incremented.
+        side_effs = {m_resultb.key:                     # Block updates
+                       [EtcdAlreadyExist(),             # 1. Fail
+                        EtcdAlreadyExist(),             # 2. Fail
+                        None],                          # 3. Success
+                     m_resulth.key:                     # Handle updates
+                       [EtcdAlreadyExist(), None, None, # 1. Inc Fail, Inc, Dec
+                        None, None,                     # 2. Inc, Dec
+                        None]}                          # 3. Inc.
+        def update(result):
+            """Either raise an exception or update the current stored value."""
+            side_eff = side_effs[result.key].pop(0)
+            if side_eff:
+                raise side_eff
+            read_results[result.key].value = result.value
+        self.m_etcd_client.update.side_effect = update
+
+        with patch("pycalico.ipam.BlockHandleReaderWriter._get_affine_blocks",
+                   m_get_affine_blocks):
+            (ipv4s, ipv6s) = self.client.auto_assign_ips(1, 0, handle_id, {})
+            assert_list_equal([IPAddress("10.11.12.0")], ipv4s)
+
+        # Validate the handle data stored.  We should have two reserved in the
+        # block now.
+        handle = AllocationHandle.from_etcd_result(m_resulth)
+        self.assertEqual(handle.handle_id, handle_id)
+        self.assertEqual(handle.block, {"10.11.12.0/24": 2})
+
+    @patch("pycalico.block.my_hostname", "test_host1")
+    def test_auto_assign_persistent_cas(self):
+        """
+        Test of auto assign with persistent CAS errors.
+        """
+
+        def m_get_affine_blocks(self, host, ip_version, pool):
+            return [IPNetwork("10.11.12.0/24"),
+                    IPNetwork("10.11.45.0/24")]
+
+        # Initialise the block assignment.
+        block = _test_block_empty_v4()
+        m_resultb = Mock(spec=EtcdResult)
+        m_resultb.value = block.to_json()
+        m_resultb.key = "/calico/ipam/v1/assignment/ipv4/block/10.11.12.0-24"
+
+        def read(key):
+            """ Return a copy of the current stored value depending on key."""
+            return copy.copy(m_resultb)
+        self.m_etcd_client.read.side_effect = read
+        self.m_etcd_client.update.side_effect = EtcdAlreadyExist
+
+        with patch("pycalico.ipam.BlockHandleReaderWriter._get_affine_blocks",
+                   m_get_affine_blocks):
+            self.assertRaises(RuntimeError, self.client.auto_assign_ips,
+                              1, 0, None, {})
+
+    @patch("pycalico.block.my_hostname", "test_host1")
     def test_auto_assign_no_blocks(self):
         """
         Test auto assign when we haven't allocated blocks yet, but there are
@@ -345,6 +439,88 @@ class TestIPAMClient(unittest.TestCase):
         assert_equal(json_dict[AllocationBlock.ALLOCATIONS][55], 0)
 
     @patch("pycalico.block.my_hostname", "test_host1")
+    def test_assign_with_handle_cas_fails(self):
+        """
+        Test assign_ip() using a handle when the compare-and-swap fails.
+        """
+
+        # Initialise the block assignment.
+        block = _test_block_empty_v4()
+        m_resultb = Mock(spec=EtcdResult)
+        m_resultb.value = block.to_json()
+        m_resultb.key = "/calico/ipam/v1/assignment/ipv4/block/10.11.12.0-24"
+
+        # Initialise the handle assignment
+        handle_id = "handle_id_1"
+        handle0 = AllocationHandle(handle_id)
+        handle0.increment_block(IPNetwork("10.11.13.0/24"), 5)
+        m_resulth = Mock(spec=EtcdResult)
+        m_resulth.value = handle0.to_json()
+        m_resulth.key = _handle_datastore_key(handle_id)
+        m_resulth.modifiedIndex = 55555
+
+        # Read returns appropriate result based on key.
+        read_results = {m_resultb.key: m_resultb,
+                        m_resulth.key: m_resulth}
+        def read(key):
+            """ Return a copy of the current stored value depending on key."""
+            return copy.copy(read_results[key])
+        self.m_etcd_client.read.side_effect = read
+
+        # Fail the block updates a couple of times and then succeed.
+        # Similarly fail one of the handle updates.  For each failed block
+        # update the handle will be incremented and decremented, for the
+        # successful block update, the handle will be incremented.
+        side_effs = {m_resultb.key:                     # Block updates
+                       [EtcdAlreadyExist(),             # 1. Fail
+                        EtcdAlreadyExist(),             # 2. Fail
+                        None],                          # 3. Success
+                     m_resulth.key:                     # Handle updates
+                       [EtcdAlreadyExist(), None, None, # 1. Inc Fail, Inc, Dec
+                        None, None,                     # 2. Inc, Dec
+                        None]}                          # 3. Inc.
+        def update(result):
+            """Either raise an exception or update the current stored value."""
+            side_eff = side_effs[result.key].pop(0)
+            if side_eff:
+                raise side_eff
+            read_results[result.key].value = result.value
+        self.m_etcd_client.update.side_effect = update
+
+        ip0 = IPAddress("10.11.12.55")
+        self.client.assign_ip(ip0, handle_id, {})
+
+        # Assert the Block JSON shows the address allocated, and the handle
+        # JSON shows the assignment.
+        block = AllocationBlock.from_etcd_result(m_resultb)
+        expected_allocations = [None if ii != 55 else 0 for ii in range(256)]
+        assert_equal(block.allocations, expected_allocations)
+
+        handle = AllocationHandle.from_etcd_result(m_resulth)
+        self.assertEqual(handle.handle_id, handle_id)
+        self.assertDictEqual(handle.block, {"10.11.12.0/24": 1,
+                                            "10.11.13.0/24": 5})
+
+    @patch("pycalico.block.my_hostname", "test_host1")
+    def test_assign_persistent_cas_fails(self):
+        """
+        Test assign_ip() when the compare-and-swap fails persistently.
+        """
+
+        block = _test_block_empty_v4()
+        m_result0 = Mock(spec=EtcdResult)
+        m_result0.value = block.to_json()
+        def read(key):
+            return copy.copy(m_result0)
+        self.m_etcd_client.read.side_effect = read
+
+        # First update fails, then succeeds.
+        self.m_etcd_client.update.side_effect = EtcdAlreadyExist
+
+        ip0 = IPAddress("10.11.12.55")
+        self.assertRaises(RuntimeError, self.client.assign_ip, ip0, None, {})
+
+    @patch("pycalico.block.my_hostname", "test_host1")
     def test_assign_new_block(self):
         """
         Test assign_ip() when address is in a block that hasn't been written.
@@ -462,6 +638,16 @@ class TestIPAMClient(unittest.TestCase):
         json_dict = json.loads(m_result.value)
         assert_equal(json_dict[AllocationBlock.ALLOCATIONS][55], 0)
 
+    def test_assign_address_no_pool(self):
+        """
+        Mainline test of assign_address().
+        """
+
+        self.m_etcd_client.read.side_effect = EtcdKeyNotFound
+
+        ip0 = IPAddress("10.11.12.55")
+        self.assertRaises(PoolNotFound, self.client.assign_address, None, ip0)
+
     def test_assign_address_fails(self):
         """
         Test assign_address() when it fails.
@@ -478,6 +664,17 @@ class TestIPAMClient(unittest.TestCase):
         success = self.client.assign_address(pool, ip0)
         assert_false(success)
         assert_false(self.m_etcd_client.update.called)
+
+    def test_unassign_address_no_pool(self):
+        """
+        Mainline test of assign_address().
+        """
+
+        self.m_etcd_client.read.side_effect = EtcdKeyNotFound
+
+        ip0 = IPAddress("10.11.12.55")
+        self.assertRaises(PoolNotFound, self.client.unassign_address,
+                          None, ip0)
 
     def test_release_basic(self):
         """
@@ -647,6 +844,186 @@ class TestIPAMClient(unittest.TestCase):
             assert_set_equal(err, set())
 
         assert_dict_equal(call_count, {4: 2, 6: 1})
+
+    def test_release_with_handle(self):
+        """
+        Basic test of release_ip where blocks have handles allocated.
+        """
+        # Create the blocks and mock out _read_block
+        cidr4 = IPNetwork("10.11.12.0/24")
+        cidr6 = IPNetwork("2001:abcd:def0::/120")
+        ip4 = IPAddress("10.11.12.13")
+        ip6 = IPAddress("2001:abcd:def0::0045")
+        handle_id = "handle_id_1"
+
+        m_resultb4 = Mock(spec=EtcdResult)
+        m_resultb6 = Mock(spec=EtcdResult)
+        block4 = _test_block_empty_v4()
+        block4.assign(ip4, handle_id, {})
+        block4.db_result = m_resultb4
+        m_resultb4.key = "fake/ipv4key"
+        block6 = _test_block_empty_v6()
+        block6.assign(ip6, handle_id, {})
+        block6.db_result = m_resultb6
+        m_resultb6.key = "fake/ipv6key"
+
+        def m_read_block(self, block_cidr):
+            if block_cidr == block4.cidr:
+                return block4
+            if block_cidr == block6.cidr:
+                return block6
+            assert_true(False, "Unexpected block CIDR")
+
+        # Create the handle and mock out read.
+        handle0 = AllocationHandle(handle_id)
+        handle0.increment_block(cidr4, 5)
+        handle0.increment_block(cidr6, 3)
+
+        m_resulth = Mock(spec=EtcdResult)
+        m_resulth.value = handle0.to_json()
+        m_resulth.key = _handle_datastore_key(handle_id)
+        self.m_etcd_client.read.return_value = m_resulth
+
+        with patch("pycalico.ipam.BlockHandleReaderWriter._read_block",
+                   m_read_block):
+            ips = {ip4, ip6}
+            err = self.client.release_ips(ips)
+            assert_set_equal(err, set())
+
+        self.m_etcd_client.update.assert_has_calls([call(m_resulth),
+                                                    call(m_resultb4),
+                                                    call(m_resultb6)],
+                                                   any_order=True)
+
+        # Check handle counts.
+        handle = AllocationHandle.from_etcd_result(m_resulth)
+        self.assertEqual(handle.block[str(cidr4)], 4)
+        self.assertEqual(handle.block[str(cidr6)], 2)
+
+    def test_release_ip_by_handle_cas_error(self):
+        """
+        Basic test of release_ip_by_handle with a single CAS error.
+        """
+        # Create the blocks.
+        cidr4 = IPNetwork("10.11.12.0/24")
+        cidr6 = IPNetwork("2001:abcd:def0::/120")
+        ip4 = IPAddress("10.11.12.13")
+        ip6 = IPAddress("2001:abcd:def0::0045")
+        handle_id = "handle_id_1"
+
+        m_resultb4 = Mock(spec=EtcdResult)
+        m_resultb6 = Mock(spec=EtcdResult)
+        block4 = _test_block_empty_v4()
+        block4.assign(ip4, handle_id, {})
+        m_resultb4.key = _block_datastore_key(cidr4)
+        m_resultb4.value = block4.to_json()
+        block6 = _test_block_empty_v6()
+        block6.assign(ip6, handle_id, {})
+        m_resultb6.key = _block_datastore_key(cidr6)
+        m_resultb6.value = block6.to_json()
+
+        # Create the handle and mock.
+        handle0 = AllocationHandle(handle_id)
+        handle0.increment_block(cidr4, 1)
+        handle0.increment_block(cidr6, 1)
+
+        m_resulth = Mock(spec=EtcdResult)
+        m_resulth.value = handle0.to_json()
+        m_resulth.key = _handle_datastore_key(handle_id)
+        m_resulth.modifiedIndex = 55555
+
+        # Mock out read.  We return a copy of the data so that it only gets
+        # updated in the update() function.
+        read_results = {m_resulth.key: m_resulth,
+                        m_resultb4.key: m_resultb4,
+                        m_resultb6.key: m_resultb6}
+        def read(key):
+            return copy.copy(read_results[key])
+        self.m_etcd_client.read.side_effect = read
+
+        # Mock out update, so we can fail the first one.  We should then get
+        # a successful update for the block, an update for the handle, an
+        # update for the next block.  The handle is then deleted.
+        update_errors = [EtcdAlreadyExist(), None, None, None]
+
+        def update(result):
+            error = update_errors.pop(0)
+            if error:
+                raise error
+            read_results[result.key].value = result.value
+        self.m_etcd_client.update.side_effect = update
+
+        self.client.release_ip_by_handle(handle_id)
+
+        # Check update was called the expected number of times and with the
+        # correct parameters.
+        self.assertEqual(update_errors, [])
+
+        # Check that delete was called for the handle.
+        self.m_etcd_client.delete.assert_called_once_with(m_resulth.key,
+                                                          prevIndex=55555)
+
+    def test_release_ip_by_handle_no_block(self):
+        """
+        Test of release_ip_by_handle when referenced block does not exist.
+        """
+        # Create the blocks.
+        cidr4 = IPNetwork("10.11.12.0/24")
+        cidr6 = IPNetwork("2001:abcd:def0::/120")
+        handle_id = "handle_id_1"
+
+        # Create the handle and mock.
+        handle0 = AllocationHandle(handle_id)
+        handle0.increment_block(cidr4, 1)
+        handle0.increment_block(cidr6, 1)
+
+        m_resulth = Mock(spec=EtcdResult)
+        m_resulth.value = handle0.to_json()
+        m_resulth.key = _handle_datastore_key(handle_id)
+        m_resulth.modifiedIndex = 55555
+
+        # Mock out read for the handle.
+        self.m_etcd_client.read.return_value = m_resulth
+
+        with patch("pycalico.ipam.BlockHandleReaderWriter._read_block",
+                   side_effect=KeyError):
+            self.client.release_ip_by_handle(handle_id)
+
+        self.assertEqual(self.m_etcd_client.update.call_count, 0)
+
+    def test_release_ip_by_handle_no_ips(self):
+        """
+        Test of release_ip_by_handle when referenced block has no handle IPs.
+        """
+        # Create the blocks.
+        cidr4 = IPNetwork("10.11.12.0/24")
+        ip4 = IPAddress("10.11.12.13")
+        handle_id = "handle_id_1"
+
+        m_resultb4 = Mock(spec=EtcdResult)
+        block4 = _test_block_empty_v4()
+        block4.assign(ip4, None, {})
+        m_resultb4.key = _block_datastore_key(cidr4)
+        m_resultb4.value = block4.to_json()
+
+        # Create the handle and mock.
+        handle0 = AllocationHandle(handle_id)
+        handle0.increment_block(cidr4, 1)
+
+        m_resulth = Mock(spec=EtcdResult)
+        m_resulth.value = handle0.to_json()
+        m_resulth.key = _handle_datastore_key(handle_id)
+        m_resulth.modifiedIndex = 55555
+
+        # Mock out read.
+        read_results = {m_resulth.key: m_resulth,
+                        m_resultb4.key: m_resultb4}
+        def read(key):
+            return read_results[key]
+        self.m_etcd_client.read.side_effect = read
+
+        self.client.release_ip_by_handle(handle_id)
+        self.assertEqual(self.m_etcd_client.update.call_count, 0)
 
     def test_unassign_address(self):
         """
@@ -1115,6 +1492,20 @@ class TestBlockHandleReaderWriter(unittest.TestCase):
         handle2 = AllocationHandle.from_etcd_result(m_result0)
         assert_equal(handle2.decrement_block(block_cidr, amount), 0)
 
+    def test_decrement_handle_does_not_exist(self):
+        """
+        Test _decrement_handle when it does not exist.
+        """
+
+        handle_id = "handle_id_1"
+        block_cidr = IPNetwork("10.11.12.0/24")
+        amount = 10
+        self.m_etcd_client.read.side_effect = KeyError
+
+        self.assertRaises(KeyError, self.client._decrement_handle,
+                          handle_id, block_cidr, amount)
+        self.assertEqual(self.m_etcd_client.update.call_count, 0)
+
     def test_decrement_handle_empty(self):
         """
         Test _decrement_handle when it empties the handle.
@@ -1136,4 +1527,101 @@ class TestBlockHandleReaderWriter(unittest.TestCase):
         self.m_etcd_client.delete.assert_called_once_with(ANY,
                                                           prevIndex=55555)
 
+    def test_decrement_handle_empty(self):
+        """
+        Test _decrement_handle when it empties the handle.
+        """
 
+        handle_id = "handle_id_1"
+        block_cidr = IPNetwork("10.11.12.0/24")
+        amount = 10
+
+        handle0 = AllocationHandle(handle_id)
+        handle0.increment_block(block_cidr, amount)
+        m_result0 = Mock(spec=EtcdResult)
+        m_result0.value = handle0.to_json()
+        m_result0.modifiedIndex = 55555
+
+        self.m_etcd_client.read.return_value = m_result0
+
+        self.client._decrement_handle(handle_id, block_cidr, amount)
+        self.m_etcd_client.delete.assert_called_once_with(ANY,
+                                                          prevIndex=55555)
+
+    def test_decrement_handle_corrupt_count(self):
+        """
+        Test _decrement_handle when it decrements the address count below 0.
+        """
+
+        handle_id = "handle_id_1"
+        block_cidr = IPNetwork("10.11.12.0/24")
+        amount = 10
+
+        handle0 = AllocationHandle(handle_id)
+        handle0.increment_block(block_cidr, amount)
+        m_result0 = Mock(spec=EtcdResult)
+        m_result0.value = handle0.to_json()
+        m_result0.modifiedIndex = 55555
+
+        self.m_etcd_client.read.return_value = m_result0
+
+        self.assertRaises(AddressCountTooLow, self.client._decrement_handle,
+                          handle_id, block_cidr, amount + 1)
+        self.assertEqual(self.m_etcd_client.delete.call_count, 0)
+
+    def test_decrement_handle_cas_error_empty(self):
+        """
+        Test _decrement_handle when it maxes out CAS errors.
+        """
+
+        handle_id = "handle_id_1"
+        block_cidr = IPNetwork("10.11.12.0/24")
+        amount = 10
+
+        def read(*args, **kwargs):
+            handle0 = AllocationHandle(handle_id)
+            handle0.increment_block(block_cidr, amount)
+            m_result0 = Mock(spec=EtcdResult)
+            m_result0.value = handle0.to_json()
+            m_result0.modifiedIndex = 55555
+            return m_result0
+
+        self.m_etcd_client.read.side_effect = read
+        self.m_etcd_client.delete.side_effect = EtcdAlreadyExist
+
+        self.assertRaises(RuntimeError, self.client._decrement_handle,
+                          handle_id, block_cidr, amount)
+
+    def test_compare_and_swap_handle_cas_error_update(self):
+        """
+        Test _compare_and_swap_handle hitting a CAS error on an update.
+        """
+        handle_id = "handle_id_1"
+        block_cidr = IPNetwork("10.11.12.0/24")
+        amount = 10
+
+        handle0 = AllocationHandle(handle_id)
+        handle0.db_result = Mock(spec=EtcdResult)
+        handle0.db_result.value = handle0.to_json()
+        handle0.db_result.modifiedIndex = 55555
+        handle0.increment_block(block_cidr, amount)
+        self.m_etcd_client.update.side_effect = EtcdAlreadyExist
+
+        self.assertRaises(CASError, self.client._compare_and_swap_handle,
+                          handle0)
+
+    def test_compare_and_swap_handle_cas_error_new(self):
+        """
+        Test _compare_and_swap_handle hitting a CAS error on adding a new
+        handle.
+        """
+        handle_id = "handle_id_1"
+        block_cidr = IPNetwork("10.11.12.0/24")
+        amount = 10
+
+        handle0 = AllocationHandle(handle_id)
+        handle0.increment_block(block_cidr, amount)
+        self.m_etcd_client.write.side_effect = EtcdAlreadyExist
+
+        self.assertRaises(CASError, self.client._compare_and_swap_handle,
+                          handle0)

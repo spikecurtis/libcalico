@@ -22,7 +22,7 @@ import logging
 import random
 
 from pycalico.datastore_datatypes import IPPool
-from pycalico.datastore import CALICO_V_PATH, DatastoreClient, handle_errors
+from pycalico.datastore import DatastoreClient
 from pycalico.datastore_errors import PoolNotFound
 from pycalico.block import (AllocationBlock,
                             get_block_cidr_for_address,
@@ -263,7 +263,7 @@ class BlockHandleReaderWriter(DatastoreClient):
                 # This is bad.  The handle doesn't exist, which means something
                 # really wrong has happened, like DB corruption.
                 _log.error("Can't decrement block %s on handle %s; it doesn't "
-                           "exist.", str(block_cidr, handle_id))
+                           "exist.", str(block_cidr), handle_id)
                 raise
 
             try:
@@ -380,8 +380,8 @@ class IPAMClient(BlockHandleReaderWriter):
         this key using get_assignments_by_handle() or release all addresses
         with this key using release_by_handle().
         :param attributes: Contents of this dict will be stored with the
-        assignment and can be queried using get_assignment_attributes().  Must be
-        JSON serializable.
+        assignment and can be queried using get_assignment_attributes().  Must
+        be JSON serializable.
         :param pool: (optional) tuple of (v4 pool, v6 pool); if supplied, the
         pool(s) to assign from,  If None, automatically choose a pool.
         :param hostname: (optional) the hostname to use for affinity in
@@ -534,11 +534,10 @@ class IPAMClient(BlockHandleReaderWriter):
                     self._decrement_handle(handle_id,
                                            block_cidr,
                                            len(unconfirmed_ips))
-                continue
             else:
                 # Confirm the IPs.
                 return unconfirmed_ips
-        raise RuntimeError("Hit Max Retries.")  # pragma: no cover
+        raise RuntimeError("Hit Max Retries.")
 
     def assign_ip(self, address, handle_id, attributes, hostname=my_hostname):
         """
@@ -590,7 +589,7 @@ class IPAMClient(BlockHandleReaderWriter):
             if handle_id is not None:
                 self._increment_handle(handle_id, block_cidr, 1)
 
-            # Try to commit
+            # Try to commit.
             try:
                 self._compare_and_swap_block(block)
                 return  # Success!
@@ -600,8 +599,7 @@ class IPAMClient(BlockHandleReaderWriter):
                     self._decrement_handle(handle_id,
                                            block_cidr,
                                            1)
-                continue
-        raise RuntimeError("Hit max retries.")  # pragma: no cover
+        raise RuntimeError("Hit max retries.")
 
     def release_ips(self, addresses):
         """
@@ -726,6 +724,7 @@ class IPAMClient(BlockHandleReaderWriter):
                 # Skip the None handle, it's a special value meaning
                 # the addresses were not allocated with a handle.
                 self._decrement_handle(handle_id, block_cidr, num_release)
+                return
         raise RuntimeError("Hit Max retries.")  # pragma: no cover
 
     def get_assignment_attributes(self, address):
