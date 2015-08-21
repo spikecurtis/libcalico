@@ -210,7 +210,7 @@ class TestIPAMClient(unittest.TestCase):
 
         # Read three times, update 3 times.
         self.m_etcd_client.read.side_effect = [m_result0, m_result1, m_result2]
-        self.m_etcd_client.update.side_effect = [EtcdAlreadyExist(),
+        self.m_etcd_client.update.side_effect = [ValueError(),
                                                  None,
                                                  None]
 
@@ -426,7 +426,7 @@ class TestIPAMClient(unittest.TestCase):
         self.m_etcd_client.read.side_effect = [m_result0, m_result1]
 
         # First update fails, then succeeds.
-        self.m_etcd_client.update.side_effect = [EtcdAlreadyExist(),
+        self.m_etcd_client.update.side_effect = [ValueError(),
                                                  None]
 
         ip0 = IPAddress("10.11.12.55")
