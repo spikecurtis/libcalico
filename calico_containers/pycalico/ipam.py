@@ -23,7 +23,7 @@ import random
 
 from pycalico.datastore_datatypes import IPPool
 from pycalico.datastore import DatastoreClient
-from pycalico.datastore_errors import PoolNotFound
+from pycalico.datastore_errors import DataStoreError, PoolNotFound
 from pycalico.block import (AllocationBlock,
                             get_block_cidr_for_address,
                             BLOCK_PREFIXLEN,
@@ -334,14 +334,14 @@ class BlockHandleReaderWriter(DatastoreClient):
                 raise CASError(handle.handle_id)
 
 
-class CASError(Exception):
+class CASError(DataStoreError):
     """
     Compare-and-swap atomic update failed.
     """
     pass
 
 
-class NoFreeBlocksError(Exception):
+class NoFreeBlocksError(DataStoreError):
     """
     Tried to get a new block but there are none available.
     """

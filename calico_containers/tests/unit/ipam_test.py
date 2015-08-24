@@ -640,7 +640,7 @@ class TestIPAMClient(unittest.TestCase):
 
     def test_assign_address_no_pool(self):
         """
-        Mainline test of assign_address().
+        Test assign_address when there are no IPPools in the data store.
         """
 
         self.m_etcd_client.read.side_effect = EtcdKeyNotFound
@@ -667,7 +667,7 @@ class TestIPAMClient(unittest.TestCase):
 
     def test_unassign_address_no_pool(self):
         """
-        Mainline test of assign_address().
+        Test unassign_address() where there are no IPPools in the data store.
         """
 
         self.m_etcd_client.read.side_effect = EtcdKeyNotFound

@@ -16,6 +16,7 @@ from netaddr import IPAddress, IPNetwork
 import socket
 import json
 import logging
+from pycalico import PyCalicoError
 
 _log = logging.getLogger(__name__)
 
@@ -464,7 +465,14 @@ def get_block_cidr_for_address(address):
     return IPNetwork(block_id)
 
 
-class NoHostAffinityWarning(Exception):
+class BlockError(PyCalicoError):
+    """
+    Base exception class for AllocationBlocks.
+    """
+    pass
+
+
+class NoHostAffinityWarning(BlockError):
     """
     Tried to auto-assign in a block this host didn't own.  This exception can
     be explicitly disabled.
@@ -472,14 +480,14 @@ class NoHostAffinityWarning(Exception):
     pass
 
 
-class AlreadyAssignedError(Exception):
+class AlreadyAssignedError(BlockError):
     """
     Tried to assign an address, but the address is already taken.
     """
     pass
 
 
-class AddressNotAssignedError(Exception):
+class AddressNotAssignedError(BlockError):
     """
     Tried to query an address that isn't assigned.
     """

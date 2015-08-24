@@ -12,20 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from etcd import EtcdKeyNotFound, EtcdAlreadyExist
 
-from netaddr import IPAddress, IPNetwork
-from types import NoneType
-import socket
+from netaddr import IPNetwork
 import json
 import logging
 
-from pycalico.datastore_datatypes import IPPool
-from pycalico.datastore import CALICO_V_PATH, DatastoreClient, handle_errors
-from pycalico.block import (AllocationBlock,
-                            get_block_cidr_for_address,
-                            BLOCK_PREFIXLEN,
-                            AlreadyAssignedError)
+from pycalico import PyCalicoError
 
 _log = logging.getLogger(__name__)
 
@@ -95,6 +87,7 @@ class AllocationHandle(object):
         :param num: Amount to increment
         :return: New count
         """
+        assert isinstance(block_cidr, IPNetwork)
         block_id = str(block_cidr)
         cur = self.block.get(block_id, 0)
         new = cur + num
@@ -108,6 +101,7 @@ class AllocationHandle(object):
         :param num: Amount to decrement
         :return: New count
         """
+        assert isinstance(block_cidr, IPNetwork)
         block_id = str(block_cidr)
         try:
             cur = self.block[block_id]
@@ -135,7 +129,14 @@ class AllocationHandle(object):
         return len(self.block) == 0
 
 
-class AddressCountTooLow(Exception):
+class HandleError(PyCalicoError):
+    """
+    Base error class for IPAM AllocationHandles.
+    """
+    pass
+
+
+class AddressCountTooLow(HandleError):
     """
     Tried to decrement the address count for a block, but it was too low to
     decrement without going below zero.
