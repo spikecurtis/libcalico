@@ -23,7 +23,7 @@ from pycalico.ipam import (IPAMClient, BlockHandleReaderWriter,
                            CASError, NoFreeBlocksError, _block_datastore_key,
                            _handle_datastore_key)
 from pycalico.datastore_errors import PoolNotFound
-from pycalico.block import AllocationBlock
+from pycalico.block import AllocationBlock, AddressNotAssignedError
 from pycalico.handle import AllocationHandle, AddressCountTooLow
 from pycalico.datastore_datatypes import IPPool
 from block_test import _test_block_empty_v4, _test_block_empty_v6
@@ -1031,7 +1031,8 @@ class TestIPAMClient(unittest.TestCase):
         """
         ip4 = IPAddress("10.11.12.13")
         m_result4 = Mock(spec=EtcdResult)
-        def m_read_block(self, block_cidr):
+
+        def m_read_block(_self, block_cidr):
             block4 = _test_block_empty_v4()
             block4.assign(ip4, None, {})
             block4.db_result = m_result4
@@ -1053,7 +1054,8 @@ class TestIPAMClient(unittest.TestCase):
         """
         ip4 = IPAddress("10.11.12.13")
         m_result4 = Mock(spec=EtcdResult)
-        def m_read_block(self, block_cidr):
+
+        def m_read_block(_self, block_cidr):
             block4 = _test_block_empty_v4()
             block4.db_result = m_result4
             if block_cidr == block4.cidr:
@@ -1067,6 +1069,89 @@ class TestIPAMClient(unittest.TestCase):
             assert_false(success)
 
         assert_false(self.m_etcd_client.update.called)
+
+    def test_get_ip_assignments_by_handle(self):
+        """
+        Test get_ip_assignments_by_handle() mainline.
+        """
+        # Create the blocks and mock out _read_block
+        cidr4 = IPNetwork("10.11.12.0/24")
+        cidr6 = IPNetwork("2001:abcd:def0::/120")
+        ip4 = IPAddress("10.11.12.13")
+        ip6 = IPAddress("2001:abcd:def0::0045")
+        handle_id0 = "handle_id_1"
+
+        block4 = _test_block_empty_v4()
+        block4.assign(ip4, handle_id0, {})
+        block6 = _test_block_empty_v6()
+        block6.assign(ip6, handle_id0, {})
+
+        def m_read_block(_self, block_cidr):
+            if block_cidr == block4.cidr:
+                return block4
+            if block_cidr == block6.cidr:
+                return block6
+            assert_true(False, "Unexpected block CIDR")
+
+        # Create the handle and mock out read.
+        handle0 = AllocationHandle(handle_id0)
+        handle0.increment_block(cidr4, 5)
+        handle0.increment_block(cidr6, 3)
+
+        def m_read_handle(_self, handle_id):
+            assert_equal(handle_id0, handle_id)
+            return handle0
+
+        with patch("pycalico.ipam.BlockHandleReaderWriter._read_block",
+                   m_read_block), \
+            patch("pycalico.ipam.BlockHandleReaderWriter._read_handle",
+                  m_read_handle):
+            expected_ips = [ip4, ip6]
+            ips = self.client.get_ip_assignments_by_handle(handle_id0)
+            assert_items_equal(expected_ips, ips)
+
+        # Test when block doesn't exist.
+        with patch("pycalico.ipam.BlockHandleReaderWriter._read_block",
+                   side_effect=KeyError), \
+            patch("pycalico.ipam.BlockHandleReaderWriter._read_handle",
+                  m_read_handle):
+            ips = self.client.get_ip_assignments_by_handle(handle_id0)
+            assert_list_equal([], ips)
+
+    def test_get_assignment_attributes(self):
+        """
+        Test get_assignment_attributes() mainline.
+        """
+        # Create the blocks and mock out _read_block
+        ip4 = IPAddress("10.11.12.13")
+        ip6 = IPAddress("2001:abcd:def0::0045")
+        handle_id4 = "handle_id_4"
+        handle_id6 = "handle_id_6"
+        attr4 = {"aaa": "bbb"}
+        attr6 = {"ccd": "ddd"}
+
+        block4 = _test_block_empty_v4()
+        block4.assign(ip4, handle_id4, attr4)
+        block6 = _test_block_empty_v6()
+        block6.assign(ip6, handle_id6, attr6)
+
+        def m_read_block(_self, block_cidr):
+            if block_cidr == block4.cidr:
+                return block4
+            if block_cidr == block6.cidr:
+                return block6
+            raise KeyError(str(block_cidr))
+
+        with patch("pycalico.ipam.BlockHandleReaderWriter._read_block",
+                   m_read_block):
+            attr = self.client.get_assignment_attributes(ip4)
+            assert_dict_equal(attr, attr4)
+            attr = self.client.get_assignment_attributes(ip6)
+            assert_dict_equal(attr, attr6)
+
+            assert_raises(AddressNotAssignedError,
+                          self.client.get_assignment_attributes,
+                          IPAddress("10.11.13.13"))
 
 
 class TestBlockHandleReaderWriter(unittest.TestCase):
@@ -1215,7 +1300,7 @@ class TestBlockHandleReaderWriter(unittest.TestCase):
             None  # 8
         ]
 
-        def m_get_ip_pools(self, version):
+        def m_get_ip_pools(_self, version):
             return [IPPool("10.11.0.0/16"), IPPool("192.168.0.0/16")]
 
         with patch("pycalico.datastore.DatastoreClient.get_ip_pools",
@@ -1246,7 +1331,7 @@ class TestBlockHandleReaderWriter(unittest.TestCase):
         Test _new_affine_block when the pool given doesn't match.
         """
 
-        def m_get_ip_pools(self, version):
+        def m_get_ip_pools(_self, version):
             return [IPPool("10.11.0.0/16"), IPPool("192.168.0.0/16")]
 
         with patch("pycalico.datastore.DatastoreClient.get_ip_pools",
@@ -1260,7 +1345,7 @@ class TestBlockHandleReaderWriter(unittest.TestCase):
         Test _new_affine_block limits to a single pool if requested.
         """
 
-        def m_get_ip_pools(self, version):
+        def m_get_ip_pools(_self, version):
             return [IPPool("10.11.0.0/16"), IPPool("192.168.0.0/16")]
 
         # Reads are always successful
@@ -1284,7 +1369,7 @@ class TestBlockHandleReaderWriter(unittest.TestCase):
         """
         Test _random_blocks() mainline.
         """
-        def m_get_ip_pools(self, version):
+        def m_get_ip_pools(_self, version):
             return [IPPool("10.11.0.0/16")]
 
         excluded_ids = [IPNetwork("10.11.23.0/24"),
@@ -1325,7 +1410,7 @@ class TestBlockHandleReaderWriter(unittest.TestCase):
         Test _random_blocks when the requested pool isn't in IPPools.
         """
 
-        def m_get_ip_pools(self, version):
+        def m_get_ip_pools(_self, version):
             return [IPPool("10.11.0.0/16"),
                     IPPool("192.168.0.0/16")]
 
@@ -1338,7 +1423,7 @@ class TestBlockHandleReaderWriter(unittest.TestCase):
         """
         Test _random_blocks() when restricted to a single pool.
         """
-        def m_get_ip_pools(self, version):
+        def m_get_ip_pools(_self, version):
             return [IPPool("10.45.0.0/16"),
                     IPPool("10.11.0.0/16")]
 
@@ -1505,27 +1590,6 @@ class TestBlockHandleReaderWriter(unittest.TestCase):
         self.assertRaises(KeyError, self.client._decrement_handle,
                           handle_id, block_cidr, amount)
         self.assertEqual(self.m_etcd_client.update.call_count, 0)
-
-    def test_decrement_handle_empty(self):
-        """
-        Test _decrement_handle when it empties the handle.
-        """
-
-        handle_id = "handle_id_1"
-        block_cidr = IPNetwork("10.11.12.0/24")
-        amount = 10
-
-        handle0 = AllocationHandle(handle_id)
-        handle0.increment_block(block_cidr, amount)
-        m_result0 = Mock(spec=EtcdResult)
-        m_result0.value = handle0.to_json()
-        m_result0.modifiedIndex = 55555
-
-        self.m_etcd_client.read.return_value = m_result0
-
-        self.client._decrement_handle(handle_id, block_cidr, amount)
-        self.m_etcd_client.delete.assert_called_once_with(ANY,
-                                                          prevIndex=55555)
 
     def test_decrement_handle_empty(self):
         """

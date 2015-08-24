@@ -21,6 +21,7 @@ from pycalico.block import (AllocationBlock,
                             BLOCK_SIZE,
                             NoHostAffinityWarning,
                             AlreadyAssignedError,
+                            AddressNotAssignedError,
                             get_block_cidr_for_address)
 from etcd import EtcdResult
 
@@ -467,6 +468,44 @@ class TestAllocationBlock(unittest.TestCase):
         assert_set_equal(err, bad_ips)
         assert_equal(block0.allocations[12], None)
         assert_equal(block0.allocations[13], None)
+
+    def test_get_ip_assignments_by_handle(self):
+        """
+        Mainline test for get_ip_assignments_by_handle()
+        """
+        block0 = _test_block_not_empty_v4()
+        ips = block0.get_ip_assignments_by_handle("key1")
+        assert_list_equal(ips, [IPAddress("10.11.12.2"),
+                                IPAddress("10.11.12.4")])
+
+        ip0 = IPAddress("10.11.12.56")
+        block0.assign(ip0, None, {})
+        ips = block0.get_ip_assignments_by_handle(None)
+        assert_list_equal(ips, [ip0])
+
+        ips = block0.get_ip_assignments_by_handle("this_handle_doesnt_exist")
+        assert_list_equal(ips, [])
+
+    def test_get_attributes_for_ip(self):
+        """
+        Mainline test for get_attributes_for_ip()
+        """
+        block0 = _test_block_not_empty_v4()
+        (handle, attrs) = block0.get_attributes_for_ip(IPAddress("10.11.12.2"))
+        assert_equal(handle, "key1")
+        assert_dict_equal(attrs, {"key21": "value1", "key22": "value2"})
+
+        ip0 = IPAddress("10.11.12.56")
+        attr0 = {"a": 1, "b": 2, "c": 3}
+        handle0 = "key0"
+        block0.assign(ip0, handle0, attr0)
+        (handle, attr) = block0.get_attributes_for_ip(ip0)
+        assert_equal(handle, handle0)
+        assert_dict_equal(attr, attr0)
+
+        ip1 = IPAddress("10.11.12.57")
+        assert_raises(AddressNotAssignedError,
+                      block0.get_attributes_for_ip, ip1)
 
 
 class TestGetBlockCIDRForAddress(unittest.TestCase):
