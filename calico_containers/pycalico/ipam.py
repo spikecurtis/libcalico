@@ -15,9 +15,8 @@
 from etcd import EtcdKeyNotFound, EtcdAlreadyExist
 
 from netaddr import IPAddress, IPNetwork
-from types import NoneType
 import socket
-import json
+import uuid
 import logging
 import random
 
@@ -394,10 +393,16 @@ class IPAMClient(BlockHandleReaderWriter):
         """
         assert isinstance(handle_id, str) or handle_id is None
 
+        _log.info("Auto-assign %d IPv4, %d IPv6 addrs",
+                  num_v4, num_v6)
         v4_address_list = self._auto_assign(4, num_v4, handle_id,
                                             attributes, pool[0], hostname)
+        _log.info("Auto-assigned IPv4s %s",
+                  [str(addr) for addr in v4_address_list])
         v6_address_list = self._auto_assign(6, num_v6, handle_id,
                                             attributes, pool[1], hostname)
+        _log.info("Auto-assigned IPv6s %s",
+                  [str(addr) for addr in v6_address_list])
         return v4_address_list, v6_address_list
 
     def _auto_assign(self, ip_version, num, handle_id,
@@ -438,6 +443,8 @@ class IPAMClient(BlockHandleReaderWriter):
             try:
                 block_id = block_ids.next()
             except StopIteration:
+                _log.info("Ran out of affine blocks for %s in pool %s",
+                          hostname, pool)
                 break
             ips = self._auto_assign_block(block_id,
                                           num_remaining,
@@ -458,7 +465,8 @@ class IPAMClient(BlockHandleReaderWriter):
                                                    pool)
                 # If successful, this creates the block and registers it to us.
             except NoFreeBlocksError:
-                # No more blocks.
+                _log.info("Could not get new host affinity block for %s in "
+                          "pool %s", hostname, pool)
                 break
             ips = self._auto_assign_block(new_block,
                                           num_remaining,
@@ -481,6 +489,7 @@ class IPAMClient(BlockHandleReaderWriter):
             try:
                 block_id = random_blocks.next()
             except StopIteration:
+                _log.warning("All addresses exhausted in pool %s", pool)
                 break
             ips = self._auto_assign_block(block_id,
                                           num_remaining,
@@ -517,7 +526,7 @@ class IPAMClient(BlockHandleReaderWriter):
                                                 attributes=attributes,
                                                 affinity_check=affinity_check)
             if len(unconfirmed_ips) == 0:
-                # Block is full.
+                _log.debug("Block %s is full.", block_cidr)
                 return []
 
             # If using a handle, increment the handle by the number of
@@ -530,13 +539,12 @@ class IPAMClient(BlockHandleReaderWriter):
             try:
                 self._compare_and_swap_block(block)
             except CASError:
-                # Failed to allocate.  Back out the handle changes if needed.
+                _log.debug("CAS failed on block %s", block_cidr)
                 if handle_id is not None:
                     self._decrement_handle(handle_id,
                                            block_cidr,
                                            len(unconfirmed_ips))
             else:
-                # Confirm the IPs.
                 return unconfirmed_ips
         raise RuntimeError("Hit Max Retries.")
 
@@ -565,16 +573,17 @@ class IPAMClient(BlockHandleReaderWriter):
             try:
                 block = self._read_block(block_cidr)
             except KeyError:
-                # Block doesn't exist.  Is it in a valid pool?
+                _log.debug("Block %s doesn't exist.", block_cidr)
                 pools = self.get_ip_pools(address.version)
                 if any([address in pool for pool in pools]):
-                    # Address is in a pool.  Create and claim the block.
+                    _log.debug("Create and claim block %s.",
+                               block_cidr)
                     try:
                         self._claim_block_affinity(hostname,
                                                    block_cidr)
                     except KeyError:
-                        # Happens if something else claims the block between
-                        # the read above and claiming it.
+                        _log.debug("Someone else claimed block %s before us.",
+                                   block_cidr)
                         continue
                     # Block exists now, retry writing to it.
                     _log.debug("Claimed block %s", block_cidr)
@@ -595,7 +604,7 @@ class IPAMClient(BlockHandleReaderWriter):
                 self._compare_and_swap_block(block)
                 return  # Success!
             except CASError:
-                # Failed to commit.  Back out handle if necessary.
+                _log.debug("CAS failed on block %s", block_cidr)
                 if handle_id is not None:
                     self._decrement_handle(handle_id,
                                            block_cidr,
@@ -611,6 +620,7 @@ class IPAMClient(BlockHandleReaderWriter):
         :return: Set of addresses that were already unallocated.
         """
         assert isinstance(addresses, (set, frozenset))
+        _log.info("Releasing addresses %s", [str(addr) for addr in addresses])
         unallocated = set()
         # sort the addresses into blocks
         addrs_by_block = {}
@@ -621,8 +631,6 @@ class IPAMClient(BlockHandleReaderWriter):
 
         # loop through blocks, CAS releasing.
         for block_cidr, addresses in addrs_by_block.iteritems():
-            _log.debug("Releasing %d adddresses from block %s",
-                       len(addresses), block_cidr)
             unalloc_block = self._release_block(block_cidr, addresses)
             unallocated = unallocated.union(unalloc_block)
         return unallocated
@@ -635,13 +643,15 @@ class IPAMClient(BlockHandleReaderWriter):
         :param addresses: List of addresses to release.
         :return: List of addresses that were already unallocated.
         """
+        _log.debug("Releasing %d adddresses from block %s",
+                   len(addresses), block_cidr)
 
         for _ in xrange(RETRIES):
             try:
                 block = self._read_block(block_cidr)
             except KeyError:
-                # Block doesn't exist, so all addresses are already
-                # unallocated.
+                _log.debug("Block %s doesn't exist.", block_cidr)
+                # OK to return, all addresses must be released already.
                 return addresses
             (unallocated, handles) = block.release(addresses)
             assert len(unallocated) <= len(addresses)
