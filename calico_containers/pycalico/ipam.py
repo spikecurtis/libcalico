@@ -320,7 +320,7 @@ class BlockHandleReaderWriter(DatastoreClient):
                 _log.debug("Handle %s is not empty.", handle.handle_id)
                 try:
                     self.etcd_client.update(handle.update_result())
-                except EtcdAlreadyExist:
+                except ValueError:
                     raise CASError(handle.handle_id)
         else:
             # Handle is new.  Write it with prevExist=False

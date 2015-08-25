@@ -225,7 +225,7 @@ class TestIPAMClient(unittest.TestCase):
     @patch("pycalico.block.my_hostname", "test_host1")
     def test_auto_assign_with_handle_cas_failure(self):
         """
-        Test of auto assign with a new handle, and transient CAS errors.
+        Test of auto assign with an existing handle, and transient CAS errors.
         """
 
         def m_get_affine_blocks(self, host, ip_version, pool):
@@ -259,14 +259,14 @@ class TestIPAMClient(unittest.TestCase):
         # Similarly fail one of the handle updates.  For each failed block
         # update the handle will be incremented and decremented, for the
         # successful block update, the handle will be incremented.
-        side_effs = {m_resultb.key:                     # Block updates
-                       [EtcdAlreadyExist(),             # 1. Fail
-                        EtcdAlreadyExist(),             # 2. Fail
-                        None],                          # 3. Success
-                     m_resulth.key:                     # Handle updates
-                       [EtcdAlreadyExist(), None, None, # 1. Inc Fail, Inc, Dec
-                        None, None,                     # 2. Inc, Dec
-                        None]}                          # 3. Inc.
+        side_effs = {m_resultb.key:  # Block updates
+                       [ValueError(),  # 1. Fail
+                        ValueError(),  # 2. Fail
+                        None],  # 3. Success
+                     m_resulth.key:  # Handle updates
+                       [ValueError(), None, None,  # 1. Inc Fail, Inc, Dec
+                        None, None,  # 2. Inc, Dec
+                        None]}  # 3. Inc.
         def update(result):
             """Either raise an exception or update the current stored value."""
             side_eff = side_effs[result.key].pop(0)
@@ -306,7 +306,7 @@ class TestIPAMClient(unittest.TestCase):
             """ Return a copy of the current stored value depending on key."""
             return copy.copy(m_resultb)
         self.m_etcd_client.read.side_effect = read
-        self.m_etcd_client.update.side_effect = EtcdAlreadyExist
+        self.m_etcd_client.update.side_effect = ValueError()
 
         with patch("pycalico.ipam.BlockHandleReaderWriter._get_affine_blocks",
                    m_get_affine_blocks):
@@ -472,11 +472,11 @@ class TestIPAMClient(unittest.TestCase):
         # update the handle will be incremented and decremented, for the
         # successful block update, the handle will be incremented.
         side_effs = {m_resultb.key:                     # Block updates
-                       [EtcdAlreadyExist(),             # 1. Fail
-                        EtcdAlreadyExist(),             # 2. Fail
+                       [ValueError(),                   # 1. Fail
+                        ValueError(),                   # 2. Fail
                         None],                          # 3. Success
                      m_resulth.key:                     # Handle updates
-                       [EtcdAlreadyExist(), None, None, # 1. Inc Fail, Inc, Dec
+                       [ValueError(), None, None,       # 1. Inc Fail, Inc, Dec
                         None, None,                     # 2. Inc, Dec
                         None]}                          # 3. Inc.
         def update(result):
@@ -515,7 +515,7 @@ class TestIPAMClient(unittest.TestCase):
         self.m_etcd_client.read.side_effect = read
 
         # First update fails, then succeeds.
-        self.m_etcd_client.update.side_effect = EtcdAlreadyExist
+        self.m_etcd_client.update.side_effect = ValueError()
 
         ip0 = IPAddress("10.11.12.55")
         self.assertRaises(RuntimeError, self.client.assign_ip, ip0, None, {})
@@ -944,7 +944,7 @@ class TestIPAMClient(unittest.TestCase):
         # Mock out update, so we can fail the first one.  We should then get
         # a successful update for the block, an update for the handle, an
         # update for the next block.  The handle is then deleted.
-        update_errors = [EtcdAlreadyExist(), None, None, None]
+        update_errors = [ValueError(), None, None, None]
 
         def update(result):
             error = update_errors.pop(0)
@@ -1669,7 +1669,7 @@ class TestBlockHandleReaderWriter(unittest.TestCase):
         handle0.db_result.value = handle0.to_json()
         handle0.db_result.modifiedIndex = 55555
         handle0.increment_block(block_cidr, amount)
-        self.m_etcd_client.update.side_effect = EtcdAlreadyExist
+        self.m_etcd_client.update.side_effect = ValueError()
 
         self.assertRaises(CASError, self.client._compare_and_swap_handle,
                           handle0)
